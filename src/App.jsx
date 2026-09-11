@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { createClient } from "@supabase/supabase-js";
 import {
   Flame, Dumbbell, TrendingUp, Utensils, User, Check, X, Droplet,
   Award, Snowflake, ChevronRight, ChevronLeft, Plus, Search, Home,
   Repeat, Clock, Lock, Barcode, Minus, Trophy, Zap, ArrowRight,
   Mail, KeyRound, LogOut, Loader2, AlertCircle, Sun, Moon, Sparkles,
-  Settings, Camera, Link2
+  Settings, Camera, Link2, Users, MessageCircle, Heart, MessageSquare,
+  Send, Image as ImageIcon, ArrowLeft, Share2, MoreHorizontal, Trash2
 } from "lucide-react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -15,8 +17,18 @@ import {
 /* ============================================================
    SUPABASE — conexão direta via REST (sem SDK)
    ============================================================ */
-const SUPABASE_URL = "https://viasudokcdnqweojqpok.supabase.co";
-const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZpYXN1ZG9rY2RucXdlb2pxcG9rIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc0MTAwMzYsImV4cCI6MjEwMjk4NjAzNn0.P1J1u4wDnEXJVKh9rpPc7goWatNaEJZ-DzaMVEqh0vA";
+// URL e chave pública vêm de variáveis de ambiente (.env, nunca commitado).
+// A ANON_KEY é feita pra ser usada no navegador — não é um segredo como a
+// GEMINI_API_KEY (essa nunca chega no frontend, mora só na Edge Function).
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+if (!SUPABASE_URL || !ANON_KEY) {
+  console.error("VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY não definidas — confira seu arquivo .env");
+}
+// cliente oficial usado SÓ para Realtime (o resto do app já usa fetch puro
+// contra a REST API — reimplementar o protocolo do Realtime na mão seria
+// arriscado, então aqui vale usar o SDK testado da própria Supabase)
+const supabaseRealtime = createClient(SUPABASE_URL, ANON_KEY);
 
 async function sbAuth(path, body) {
   const res = await fetch(`${SUPABASE_URL}/auth/v1/${path}`, {
@@ -65,6 +77,16 @@ async function sbUpdate(table, token, query, patch) {
 async function sbDelete(table, token, query) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${query}`, { method: "DELETE", headers: sbHeaders(token) });
   if (!res.ok) throw new Error(`Erro ao remover de ${table}`);
+}
+// upload de imagem (Supabase Storage) — usado pelo feed da Comunidade
+async function sbUploadFile(bucket, token, path, file) {
+  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${bucket}/${path}`, {
+    method: "POST",
+    headers: { apikey: ANON_KEY, Authorization: `Bearer ${token}`, "Content-Type": file.type || "application/octet-stream" },
+    body: file,
+  });
+  if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.message || "Falha ao enviar imagem."); }
+  return `${SUPABASE_URL}/storage/v1/object/public/${bucket}/${path}`;
 }
 
 /* ============================================================
@@ -547,7 +569,7 @@ function WelcomeModal({ nome, onClose }) {
         </motion.div>
         <div style={{ fontFamily: "Bebas Neue", fontSize: 26, color: T.ink, marginTop: 16 }}>Bem-vindo(a), {nome}<span style={{ color: T.flame }}>.</span></div>
         <div style={{ fontFamily: "Inter", fontSize: 13, color: T.steel, marginTop: 8, lineHeight: 1.5 }}>
-          Seu plano de treino e dieta já foram gerados. Bora acender essa chama hoje mesmo?
+          Sua conta está pronta. Vamos até a aba Treino deixar a IA forjar o seu primeiro plano?
         </div>
         <button onClick={onClose} style={{
           marginTop: 22, width: "100%", padding: 14, borderRadius: 12, border: "none", cursor: "pointer",
@@ -863,15 +885,26 @@ function Onboarding({ onDone, saving, error }) {
 /* ============================================================
    TREINO
    ============================================================ */
-function TreinoTab({ plan, dayIndex, setDayIndex, onSwap, onFinish, profile, onGenerateAI }) {
+function TreinoTab({ plan, dayIndex, setDayIndex, onSwap, onFinish, profile, onGenerateAI, onShareWorkout, onSavePhoto, myCommunities }) {
   const [swapFor, setSwapFor] = useState(null);
   const [logging, setLogging] = useState(null);
   const [showLoadModal, setShowLoadModal] = useState(false);
   const [pendingFeedback, setPendingFeedback] = useState(null);
   const [cargas, setCargas] = useState({});
-  const [toast, setToast] = useState(false);
   const [showAI, setShowAI] = useState(false);
+  const [lastFinished, setLastFinished] = useState(null);
+  const [showPostModal, setShowPostModal] = useState(false);
+  const [feitosPorDia, setFeitosPorDia] = useState({});
   const day = plan[dayIndex];
+  const feitos = (day && feitosPorDia[day.id]) || new Set();
+
+  function toggleFeito(exId) {
+    setFeitosPorDia((prev) => {
+      const cur = new Set(prev[day.id] || []);
+      cur.has(exId) ? cur.delete(exId) : cur.add(exId);
+      return { ...prev, [day.id]: cur };
+    });
+  }
 
   function openFinish(feedback) { setPendingFeedback(feedback); setCargas({}); setShowLoadModal(true); }
 
@@ -881,8 +914,29 @@ function TreinoTab({ plan, dayIndex, setDayIndex, onSwap, onFinish, profile, onG
     const cargaRows = day.exercicios.filter((ex) => cargas[ex.id]).map((ex) => ({ nome: ex.nome, carga: Number(cargas[ex.id]), series: ex.series, reps: ex.reps }));
     await onFinish(dayIndex, pendingFeedback, cargaRows);
     setLogging(false);
-    setToast(true);
-    setTimeout(() => setToast(false), 2600);
+    setLastFinished({ day, cargaRows });
+    setShowPostModal(true);
+  }
+
+  if (!plan.length) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", padding: "60px 20px" }}>
+        <div style={{ width: 72, height: 72, borderRadius: "50%", background: hexToRgba(T.flame, 0.10), display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 20 }}>
+          <Dumbbell size={32} color={T.flame} />
+        </div>
+        <div style={{ fontFamily: "Bebas Neue", fontSize: 22, color: T.ink, marginBottom: 8 }}>Você ainda não possui um treino</div>
+        <div style={{ fontFamily: "Inter", fontSize: 13, color: T.steel, marginBottom: 26, maxWidth: 260, lineHeight: 1.5 }}>
+          Deixe a IA forjar o seu primeiro plano!
+        </div>
+        <button onClick={() => setShowAI(true)} style={{
+          width: "100%", maxWidth: 300, padding: 18, borderRadius: 16, border: "none", cursor: "pointer",
+          background: `linear-gradient(90deg, ${T.flame}, ${T.flame2})`, color: "#1B0D06",
+          fontFamily: "Bebas Neue", fontSize: 18, letterSpacing: 1,
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+        }}><Sparkles size={20} /> CRIAR TREINO COM IA</button>
+        {showAI && <AIPlanSheet profile={profile} onClose={() => setShowAI(false)} onGenerate={onGenerateAI} />}
+      </div>
+    );
   }
 
   return (
@@ -904,19 +958,28 @@ function TreinoTab({ plan, dayIndex, setDayIndex, onSwap, onFinish, profile, onG
       </SectionTitle>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        {day.exercicios.map((ex) => (
-          <Card key={ex.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontFamily: "Inter", fontWeight: 700, fontSize: 14, color: T.ink, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{ex.nome}</div>
-            </div>
-            <div style={{ flexShrink: 0, padding: "6px 10px", borderRadius: 8, background: T.surface2, whiteSpace: "nowrap" }}>
-              <span style={{ fontFamily: "IBM Plex Mono", fontSize: 12, color: T.volt }}>{ex.series}×{ex.reps}</span>
-            </div>
-            <button onClick={() => setSwapFor(ex)} style={{ flexShrink: 0, width: 34, height: 34, borderRadius: 10, border: `1px solid ${T.line}`, background: T.surface2, color: T.steel, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <Repeat size={15} />
-            </button>
-          </Card>
-        ))}
+        {day.exercicios.map((ex) => {
+          const feito = feitos.has(ex.id);
+          return (
+            <Card key={ex.id} style={{ display: "flex", alignItems: "center", gap: 10, opacity: feito ? 0.6 : 1 }}>
+              <button onClick={() => toggleFeito(ex.id)} style={{
+                flexShrink: 0, width: 24, height: 24, borderRadius: "50%", border: `2px solid ${feito ? T.volt : T.line}`,
+                background: feito ? T.volt : "transparent", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer",
+              }}>
+                {feito && <Check size={13} color="#0E1013" />}
+              </button>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontFamily: "Inter", fontWeight: 700, fontSize: 14, color: feito ? T.steelDim : T.ink, textDecoration: feito ? "line-through" : "none", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{ex.nome}</div>
+              </div>
+              <div style={{ flexShrink: 0, padding: "6px 10px", borderRadius: 8, background: T.surface2, whiteSpace: "nowrap" }}>
+                <span style={{ fontFamily: "IBM Plex Mono", fontSize: 12, color: T.volt }}>{ex.series}×{ex.reps}</span>
+              </div>
+              <button onClick={() => setSwapFor(ex)} style={{ flexShrink: 0, width: 34, height: 34, borderRadius: 10, border: `1px solid ${T.line}`, background: T.surface2, color: T.steel, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <Repeat size={15} />
+              </button>
+            </Card>
+          );
+        })}
       </div>
 
       <SectionTitle>Como foi o treino?</SectionTitle>
@@ -927,11 +990,13 @@ function TreinoTab({ plan, dayIndex, setDayIndex, onSwap, onFinish, profile, onG
       </div>
       <div style={{ color: T.steelDim, fontSize: 12, marginTop: 8, textAlign: "center", fontFamily: "Inter" }}>A IA recalibra séries da próxima sessão com base no seu feedback.</div>
 
-      {toast && (
-        <div style={{ position: "fixed", left: 20, right: 20, bottom: 96, background: T.surface, border: `1px solid ${T.volt}`, borderRadius: 14, padding: "14px 16px", display: "flex", alignItems: "center", gap: 10, zIndex: 50 }}>
-          <Check size={18} color={T.volt} />
-          <div style={{ fontFamily: "Inter", fontSize: 13, color: T.ink }}>Treino salvo no seu histórico. Plano recalibrado.</div>
-        </div>
+      {showPostModal && lastFinished && (
+        <PostWorkoutModal
+          day={lastFinished.day} cargaRows={lastFinished.cargaRows} communities={myCommunities || []}
+          onClose={() => setShowPostModal(false)}
+          onShareToCommunity={({ day, cargaRows, file, communityId }) => onShareWorkout(day, cargaRows, file, communityId)}
+          onSaveProgressOnly={({ day, cargaRows, file }) => onSavePhoto(day, cargaRows, file)}
+        />
       )}
 
       {swapFor && (
@@ -970,6 +1035,96 @@ function TreinoTab({ plan, dayIndex, setDayIndex, onSwap, onFinish, profile, onG
     </div>
   );
 }
+function PostWorkoutModal({ day, cargaRows, communities, onClose, onShareToCommunity, onSaveProgressOnly }) {
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [loading, setLoading] = useState(null); // 'share' | 'save' | null
+  const [done, setDone] = useState(null); // 'shared' | 'saved'
+
+  function pick(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFile(f);
+    setPreview(URL.createObjectURL(f));
+  }
+
+  async function shareToCommunity() {
+    setLoading("share");
+    try { await onShareToCommunity({ day, cargaRows, file, communityId: communities[0]?.id || null }); setDone("shared"); }
+    finally { setLoading(null); }
+  }
+  async function saveOnly() {
+    if (!file) return;
+    setLoading("save");
+    try { await onSaveProgressOnly({ day, cargaRows, file }); setDone("saved"); }
+    finally { setLoading(null); }
+  }
+
+  // Passo 1: sem foto ainda — a interação é opcional, "Pular" fecha na hora
+  if (!file && !done) {
+    return (
+      <Sheet onClose={onClose}>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: 40, marginBottom: 8 }}>🔥</div>
+          <div style={{ fontFamily: "Bebas Neue", fontSize: 22, color: T.ink, marginBottom: 6 }}>Treino concluído!</div>
+          <div style={{ color: T.steel, fontSize: 12.5, marginBottom: 22, lineHeight: 1.5 }}>Quer registrar uma foto do resultado de hoje?</div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <label style={{
+            padding: 15, borderRadius: 12, border: "none", cursor: "pointer",
+            background: `linear-gradient(90deg, ${T.flame}, ${T.flame2})`, color: "#1B0D06", fontFamily: "Bebas Neue", fontSize: 15, letterSpacing: 0.5,
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+          }}>
+            <Camera size={17} /> TIRAR FOTO DE PROGRESSO
+            <input type="file" accept="image/*" capture="environment" onChange={pick} style={{ display: "none" }} />
+          </label>
+          <button onClick={onClose} style={{
+            padding: 15, borderRadius: 12, border: `1px solid ${T.line}`, cursor: "pointer",
+            background: "transparent", color: T.steel, fontFamily: "Inter", fontWeight: 700, fontSize: 13.5,
+          }}>Pular</button>
+        </div>
+      </Sheet>
+    );
+  }
+
+  return (
+    <Sheet onClose={onClose}>
+      <div style={{ fontFamily: "Bebas Neue", fontSize: 20, color: T.ink, marginBottom: 4 }}>Treino concluído 🔥</div>
+      <div style={{ color: T.steel, fontSize: 12.5, marginBottom: 16 }}>O que você quer fazer com a foto?</div>
+
+      {preview && (
+        <div style={{ position: "relative", marginBottom: 14 }}>
+          <img src={preview} alt="" style={{ width: "100%", borderRadius: 12, maxHeight: 240, objectFit: "cover" }} />
+          <button onClick={() => { setFile(null); setPreview(null); }} style={{ position: "absolute", top: 8, right: 8, width: 26, height: 26, borderRadius: "50%", border: "none", background: "rgba(0,0,0,0.6)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><X size={13} /></button>
+        </div>
+      )}
+
+      {done ? (
+        <div style={{ textAlign: "center", padding: "10px 0", color: T.volt, fontFamily: "Inter", fontWeight: 700, fontSize: 13 }}>
+          {done === "shared" ? "Compartilhado na comunidade ✓" : "Salvo no seu progresso ✓"}
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {communities.length > 0 ? (
+            <button disabled={!!loading} onClick={shareToCommunity} style={{
+              padding: 14, borderRadius: 12, border: "none", cursor: loading ? "default" : "pointer",
+              background: `linear-gradient(90deg, ${T.flame}, ${T.flame2})`, color: "#1B0D06", fontFamily: "Bebas Neue", fontSize: 15, letterSpacing: 0.5,
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+            }}>{loading === "share" ? <Spinner size={15} color="#1B0D06" /> : <><Share2 size={15} /> COMPARTILHAR NA COMUNIDADE</>}</button>
+          ) : (
+            <div style={{ fontFamily: "Inter", fontSize: 11.5, color: T.steelDim, textAlign: "center", marginBottom: 2 }}>Entre em uma comunidade pra poder compartilhar treinos.</div>
+          )}
+          <button disabled={!!loading || !file} onClick={saveOnly} style={{
+            padding: 14, borderRadius: 12, border: `1px solid ${T.line}`, cursor: (loading || !file) ? "default" : "pointer",
+            background: T.surface2, color: file ? T.ink : T.steelDim, fontFamily: "Bebas Neue", fontSize: 15, letterSpacing: 0.5,
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+          }}>{loading === "save" ? <Spinner size={15} color={T.ink} /> : "SALVAR APENAS NO MEU PROGRESSO"}</button>
+        </div>
+      )}
+    </Sheet>
+  );
+}
+
 function AIPlanSheet({ profile, onClose, onGenerate }) {
   const [params, setParams] = useState({
     nivel_experiencia: profile.nivel_experiencia, objetivo_principal: profile.objetivo_principal,
@@ -1263,16 +1418,18 @@ function DietaTab({ peso, objetivoPrincipal, nivelAtividade, dietaTipo, meals, w
     pendente: { label: "PENDENTE", color: T.red },
   };
 
-  async function handleGenClick() {
+  const [showFlexSheet, setShowFlexSheet] = useState(false);
+
+  async function handleGenerate(alimentoDesejado) {
     setGenLoading(true);
-    try { await onGenerateDietAI(); } catch (e) { /* erro já tratado no App */ }
-    finally { setGenLoading(false); }
+    try { await onGenerateDietAI(alimentoDesejado); } catch (e) { /* erro já tratado no App */ }
+    finally { setGenLoading(false); setShowFlexSheet(false); }
   }
 
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
-        <button disabled={genLoading} onClick={handleGenClick} style={{
+        <button disabled={genLoading} onClick={() => setShowFlexSheet(true)} style={{
           display: "flex", alignItems: "center", gap: 6, padding: "7px 12px", borderRadius: 999,
           border: `1px solid ${T.flame}`, background: hexToRgba(T.flame, 0.10), color: T.flame2,
           fontFamily: "Inter", fontWeight: 700, fontSize: 12, cursor: genLoading ? "default" : "pointer",
@@ -1380,7 +1537,37 @@ function DietaTab({ peso, objetivoPrincipal, nivelAtividade, dietaTipo, meals, w
           onPick={(f) => { onAddMeal(f, addSlot.id); setAddSlot(null); setSearch(""); }}
         />
       )}
+
+      {showFlexSheet && <FlexDietSheet loading={genLoading} onClose={() => setShowFlexSheet(false)} onGenerate={handleGenerate} />}
     </div>
+  );
+}
+
+function FlexDietSheet({ loading, onClose, onGenerate }) {
+  const [alimento, setAlimento] = useState("");
+  return (
+    <Sheet onClose={onClose}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+        <Sparkles size={18} color={T.flame} />
+        <div style={{ fontFamily: "Bebas Neue", fontSize: 20, color: T.ink }}>Gerar dieta com IA</div>
+      </div>
+      <div style={{ color: T.steel, fontSize: 12.5, marginBottom: 16, lineHeight: 1.4 }}>
+        Deseja encaixar algum alimento específico na sua dieta hoje? A IA vai calcular os macros pra encaixá-lo sem estourar suas calorias.
+      </div>
+      <input
+        value={alimento} onChange={(e) => setAlimento(e.target.value)}
+        placeholder="Ex: Um sonho de padaria (opcional)"
+        style={{ width: "100%", padding: 14, borderRadius: 12, border: `1.5px solid ${T.line}`, background: T.surface2, color: T.ink, fontFamily: "Inter", fontSize: 13.5, marginBottom: 16 }}
+      />
+      <button disabled={loading} onClick={() => onGenerate(alimento.trim())} style={{
+        width: "100%", padding: 14, borderRadius: 12, border: "none", cursor: loading ? "default" : "pointer",
+        background: `linear-gradient(90deg, ${T.flame}, ${T.flame2})`, color: "#1B0D06",
+        fontFamily: "Bebas Neue", fontSize: 16, letterSpacing: 1,
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+      }}>
+        {loading ? <><Spinner size={16} color="#1B0D06" /> Gerando...</> : "GERAR"}
+      </button>
+    </Sheet>
   );
 }
 
@@ -1460,18 +1647,1366 @@ function AddFoodSheet({ slot, search, setSearch, filtered, onClose, onPick }) {
 }
 
 /* ============================================================
+   COMUNIDADE — feed social (posts, curtidas, comentários) + chat
+   ============================================================ */
+function timeAgo(iso) {
+  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (diff < 60) return "agora";
+  if (diff < 3600) return `${Math.floor(diff / 60)}min`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+  return `${Math.floor(diff / 86400)}d`;
+}
+
+function PostCard({ post, author, liked, likeCount, comments, currentUserId, onToggleLike, onAddComment, onOpenProfile, commentAuthors, communityName, following, onToggleFollow, onRepost, onDelete }) {
+  const [showComments, setShowComments] = useState(false);
+  const [commentText, setCommentText] = useState("");
+  const [expanded, setExpanded] = useState(false);
+  const [showMenu, setShowMenu] = useState(false);
+  const isRepost = !!post.reposted_from;
+  const content = isRepost ? post.meta?.original_content : post.content;
+  const imageUrl = isRepost ? post.meta?.original_image_url : post.image_url;
+  const headerAuthor = isRepost
+    ? { id: post.meta?.original_author_id, nome: post.meta?.original_author_nome, avatar_url: post.meta?.original_author_avatar }
+    : author;
+  const longText = content && content.length > 220;
+  const isMine = post.user_id === currentUserId;
+
+  return (
+    <Card style={{ padding: 14, borderRadius: 18 }}>
+      {isRepost && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10, color: T.steel, fontFamily: "Inter", fontSize: 11.5, fontWeight: 700 }}>
+          <Repeat size={13} /> {author.nome || "Atleta"} republicou
+        </div>
+      )}
+      <div style={isRepost ? { borderLeft: `2.5px solid ${T.flame}`, paddingLeft: 12 } : undefined}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+          <button onClick={() => onOpenProfile(headerAuthor)} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+            {headerAuthor.avatar_url ? (
+              <img src={headerAuthor.avatar_url} alt="" style={{ width: 36, height: 36, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }} onError={(e) => { e.target.style.display = "none"; }} />
+            ) : (
+              <div style={{ width: 36, height: 36, borderRadius: "50%", background: T.surface2, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><User size={16} color={T.steelDim} /></div>
+            )}
+            <div style={{ textAlign: "left", minWidth: 0 }}>
+              <div style={{ fontFamily: "Inter", fontWeight: 700, fontSize: 13, color: T.ink, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{headerAuthor.nome || "Atleta"}</div>
+              <div style={{ fontFamily: "Inter", fontSize: 10.5, color: T.steelDim, display: "flex", alignItems: "center", gap: 4 }}>
+                <span>há {timeAgo(post.created_at)}</span>
+                {communityName && <><span>·</span><span>{communityName}</span></>}
+              </div>
+            </div>
+          </button>
+          {!isRepost && headerAuthor.id !== currentUserId && onToggleFollow && (
+            <button onClick={() => onToggleFollow(headerAuthor)} style={{
+              marginLeft: "auto", padding: "5px 10px", borderRadius: 999, border: `1px solid ${following ? T.line : T.flame}`,
+              background: following ? "transparent" : hexToRgba(T.flame, 0.10), color: following ? T.steel : T.flame2,
+              fontFamily: "Inter", fontWeight: 700, fontSize: 10.5, cursor: "pointer", flexShrink: 0,
+            }}>{following ? "Seguindo" : "Seguir"}</button>
+          )}
+          {post.type === "treino" && (
+            <span style={{ marginLeft: (!isRepost && onToggleFollow) ? 6 : "auto", flexShrink: 0, display: "flex", alignItems: "center", gap: 4, padding: "3px 8px", borderRadius: 999, background: hexToRgba(T.flame, 0.10) }}>
+              <Flame size={11} color={T.flame} /><span style={{ fontFamily: "Inter", fontSize: 10, fontWeight: 700, color: T.flame2 }}>TREINO</span>
+            </span>
+          )}
+          {isMine && onDelete && (
+            <button onClick={() => setShowMenu(true)} style={{ marginLeft: post.type !== "treino" ? "auto" : 4, background: "none", border: "none", color: T.steelDim, cursor: "pointer", flexShrink: 0, padding: 4 }}>
+              <MoreHorizontal size={17} />
+            </button>
+          )}
+        </div>
+
+        {content && (
+          <div style={{ fontFamily: "Inter", fontSize: 13.5, color: T.ink, marginBottom: imageUrl ? 10 : 4, lineHeight: 1.5 }}>
+            {longText && !expanded ? content.slice(0, 220) + "… " : content}
+            {longText && (
+              <button onClick={() => setExpanded((e) => !e)} style={{ background: "none", border: "none", color: T.steel, fontFamily: "Inter", fontWeight: 700, fontSize: 12, cursor: "pointer", padding: 0 }}>
+                {expanded ? " ver menos" : "ver mais"}
+              </button>
+            )}
+          </div>
+        )}
+        {imageUrl && <img src={imageUrl} alt="" style={{ width: "100%", aspectRatio: "4/5", borderRadius: 14, marginBottom: 8, display: "block", objectFit: "cover" }} />}
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 18, marginTop: 8 }}>
+        <button onClick={() => onToggleLike(post)} style={{ display: "flex", alignItems: "center", gap: 5, background: "none", border: "none", cursor: "pointer", color: liked ? T.flame : T.steel }}>
+          <Heart size={17} fill={liked ? T.flame : "none"} />
+          <span style={{ fontFamily: "IBM Plex Mono", fontSize: 12 }}>{likeCount}</span>
+        </button>
+        <button onClick={() => setShowComments(true)} style={{ display: "flex", alignItems: "center", gap: 5, background: "none", border: "none", cursor: "pointer", color: T.steel }}>
+          <MessageSquare size={16} />
+          <span style={{ fontFamily: "IBM Plex Mono", fontSize: 12 }}>{comments.length}</span>
+        </button>
+        {onRepost && (
+          <button onClick={() => onRepost(post)} style={{ display: "flex", alignItems: "center", gap: 5, background: "none", border: "none", cursor: "pointer", color: T.steel, marginLeft: "auto" }}>
+            <Repeat size={16} />
+          </button>
+        )}
+      </div>
+
+      {showComments && (
+        <Sheet onClose={() => setShowComments(false)}>
+          <div style={{ fontFamily: "Bebas Neue", fontSize: 18, color: T.ink, marginBottom: 14 }}>Comentários</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, maxHeight: "45vh", overflowY: "auto", marginBottom: 14 }}>
+            {comments.length === 0 && <div style={{ fontFamily: "Inter", fontSize: 12.5, color: T.steelDim, textAlign: "center", padding: "10px 0" }}>Nenhum comentário ainda.</div>}
+            {comments.map((c) => {
+              const ca = commentAuthors[c.user_id] || {};
+              return (
+                <div key={c.id} style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                  {ca.avatar_url ? <img src={ca.avatar_url} alt="" style={{ width: 26, height: 26, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }} /> : <div style={{ width: 26, height: 26, borderRadius: "50%", background: T.surface2, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}><User size={12} color={T.steelDim} /></div>}
+                  <div style={{ background: T.surface2, borderRadius: 12, padding: "7px 11px", flex: 1 }}>
+                    <div style={{ fontFamily: "Inter", fontWeight: 700, fontSize: 11.5, color: T.steel, marginBottom: 2 }}>{ca.nome || "Atleta"}</div>
+                    <div style={{ fontFamily: "Inter", fontSize: 12.5, color: T.ink }}>{c.content}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={commentText} onChange={(e) => setCommentText(e.target.value)} placeholder="Comente..." style={{ flex: 1, padding: "10px 14px", borderRadius: 999, border: `1px solid ${T.line}`, background: T.surface2, color: T.ink, fontFamily: "Inter", fontSize: 13 }} />
+            <button onClick={() => { if (commentText.trim()) { onAddComment(post, commentText.trim()); setCommentText(""); } }} style={{ width: 40, height: 40, borderRadius: "50%", border: "none", background: T.flame, color: "#1B0D06", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}>
+              <Send size={15} />
+            </button>
+          </div>
+        </Sheet>
+      )}
+
+      {showMenu && (
+        <Sheet onClose={() => setShowMenu(false)}>
+          <button onClick={() => { onDelete(post); setShowMenu(false); }} style={{
+            width: "100%", padding: 14, borderRadius: 12, border: `1px solid ${T.red}`, background: hexToRgba(T.red, 0.08),
+            color: T.red, fontFamily: "Inter", fontWeight: 700, fontSize: 13.5, cursor: "pointer", textAlign: "left",
+            display: "flex", alignItems: "center", gap: 8,
+          }}><Trash2 size={15} /> Excluir postagem</button>
+        </Sheet>
+      )}
+    </Card>
+  );
+}
+
+function ExploreScreen({ userId, token, myProfile, onOpenMessages, onOpenProfile, hasUnreadDM }) {
+  const [subTab, setSubTab] = useState("paravoce"); // seguindo | paravoce
+  const [posts, setPosts] = useState([]);
+  const [profilesById, setProfilesById] = useState({});
+  const [communitiesById, setCommunitiesById] = useState({});
+  const [likesByPost, setLikesByPost] = useState({});
+  const [commentsByPost, setCommentsByPost] = useState({});
+  const [followingIds, setFollowingIds] = useState(new Set());
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const [showComposer, setShowComposer] = useState(false);
+  const PAGE_SIZE = 10;
+  const sentinelRef = React.useRef(null);
+  const offsetRef = React.useRef(0);
+
+  const enrichAndAppend = useCallback(async (newPosts, replace) => {
+    const uids = [...new Set(newPosts.map((p) => p.user_id))];
+    if (uids.length) {
+      const profs = await sbSelect("public_profiles", token, `id=in.(${uids.join(",")})&select=*`);
+      setProfilesById((prev) => ({ ...prev, ...Object.fromEntries(profs.map((pr) => [pr.id, pr])) }));
+    }
+    const cids = [...new Set(newPosts.map((p) => p.community_id).filter(Boolean))];
+    if (cids.length) {
+      const comms = await sbSelect("communities", token, `id=in.(${cids.join(",")})&select=id,nome`);
+      setCommunitiesById((prev) => ({ ...prev, ...Object.fromEntries(comms.map((c) => [c.id, c.nome])) }));
+    }
+    if (newPosts.length) {
+      const ids = newPosts.map((p) => p.id).join(",");
+      const [l, c] = await Promise.all([
+        sbSelect("likes", token, `post_id=in.(${ids})&select=*`),
+        sbSelect("comments", token, `post_id=in.(${ids})&select=*&order=created_at.asc`),
+      ]);
+      setLikesByPost((prev) => { const next = replace ? {} : { ...prev }; l.forEach((x) => { (next[x.post_id] ||= new Set()).add(x.user_id); }); return next; });
+      setCommentsByPost((prev) => { const next = replace ? {} : { ...prev }; c.forEach((x) => { (next[x.post_id] ||= []).push(x); }); return next; });
+    }
+    setPosts((prev) => replace ? newPosts : [...prev, ...newPosts]);
+  }, [token]);
+
+  const loadPage = useCallback(async (isFirst) => {
+    if (isFirst) setLoading(true); else setLoadingMore(true);
+    try {
+      const from = isFirst ? 0 : offsetRef.current;
+      let query = `community_id=is.null&select=*&order=created_at.desc&limit=${PAGE_SIZE}&offset=${from}`;
+      if (subTab === "seguindo") {
+        const followed = await sbSelect("follows", token, `follower_id=eq.${userId}&select=following_id`);
+        const ids = followed.map((f) => f.following_id);
+        setFollowingIds(new Set(ids));
+        if (!ids.length) { setPosts([]); setHasMore(false); return; }
+        query = `community_id=is.null&user_id=in.(${ids.join(",")})&select=*&order=created_at.desc&limit=${PAGE_SIZE}&offset=${from}`;
+      }
+      const rows = await sbSelect("posts", token, query);
+      await enrichAndAppend(rows, isFirst);
+      offsetRef.current = from + rows.length;
+      setHasMore(rows.length === PAGE_SIZE);
+    } catch (e) { /* mantém o que já tem */ }
+    finally { setLoading(false); setLoadingMore(false); }
+  }, [subTab, userId, token, enrichAndAppend]);
+
+  useEffect(() => {
+    offsetRef.current = 0; setHasMore(true); setPosts([]);
+    if (subTab === "seguindo") sbSelect("follows", token, `follower_id=eq.${userId}&select=following_id`).then((f) => setFollowingIds(new Set(f.map((x) => x.following_id)))).catch(() => {});
+    loadPage(true);
+  }, [subTab]); // eslint-disable-line
+
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el) return;
+    const obs = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting && hasMore && !loading && !loadingMore) loadPage(false);
+    }, { threshold: 0.1 });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [hasMore, loading, loadingMore, loadPage]);
+
+  async function toggleLike(post) {
+    const already = likesByPost[post.id]?.has(userId);
+    setLikesByPost((prev) => { const next = new Set(prev[post.id] || []); already ? next.delete(userId) : next.add(userId); return { ...prev, [post.id]: next }; });
+    try {
+      if (already) await sbDelete("likes", token, `post_id=eq.${post.id}&user_id=eq.${userId}`);
+      else await sbInsert("likes", token, [{ post_id: post.id, user_id: userId }]);
+    } catch (e) { /* estado local já otimista */ }
+  }
+  async function addComment(post, text) {
+    try {
+      const created = await sbInsert("comments", token, [{ post_id: post.id, user_id: userId, content: text }]);
+      setCommentsByPost((prev) => ({ ...prev, [post.id]: [...(prev[post.id] || []), created[0]] }));
+      if (!profilesById[userId]) setProfilesById((p) => ({ ...p, [userId]: myProfile }));
+    } catch (e) { /* silencioso */ }
+  }
+  async function toggleFollow(author) {
+    const already = followingIds.has(author.id);
+    setFollowingIds((prev) => { const next = new Set(prev); already ? next.delete(author.id) : next.add(author.id); return next; });
+    try {
+      if (already) await sbDelete("follows", token, `follower_id=eq.${userId}&following_id=eq.${author.id}`);
+      else await sbInsert("follows", token, [{ follower_id: userId, following_id: author.id }]);
+    } catch (e) { /* mantém estado local */ }
+  }
+  async function repost(post) {
+    const original = profilesById[post.user_id] || { nome: "Atleta" };
+    const meta = { original_author_id: post.user_id, original_author_nome: original.nome, original_author_avatar: original.avatar_url || null, original_content: post.content, original_image_url: post.image_url };
+    try {
+      const created = await sbInsert("posts", token, [{ user_id: userId, community_id: null, content: null, image_url: null, type: post.type, reposted_from: post.id, meta }]);
+      setPosts((p) => [created[0], ...p]);
+      setProfilesById((p) => ({ ...p, [userId]: myProfile }));
+    } catch (e) { /* rate limit ou outro erro do trigger — silencioso aqui */ }
+  }
+  async function deletePost(post) {
+    setPosts((p) => p.filter((x) => x.id !== post.id));
+    try { await sbDelete("posts", token, `id=eq.${post.id}`); } catch (e) { /* já removido localmente */ }
+  }
+  async function handleNewPost({ content, imageUrl }) {
+    try {
+      const created = await sbInsert("posts", token, [{ user_id: userId, community_id: null, content, image_url: imageUrl || null, type: "foto" }]);
+      setPosts((p) => [created[0], ...p]);
+      setProfilesById((p) => ({ ...p, [userId]: myProfile }));
+    } catch (e) { throw e; }
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <div style={{ fontFamily: "Bebas Neue", fontSize: 24, color: T.ink }}>Comunidade</div>
+        <button onClick={onOpenMessages} style={{ position: "relative", width: 36, height: 36, borderRadius: "50%", border: `1px solid ${T.line}`, background: T.surface, color: T.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+          <MessageCircle size={17} />
+          {hasUnreadDM && <span style={{ position: "absolute", top: -2, right: -2, width: 11, height: 11, borderRadius: "50%", background: T.red, border: `2px solid ${T.bg}` }} />}
+        </button>
+      </div>
+
+      <StoriesBar userId={userId} token={token} myProfile={myProfile} />
+
+      <div style={{ display: "flex", background: T.surface2, borderRadius: 12, padding: 4, marginBottom: 14, border: `1px solid ${T.line}` }}>
+        {[["seguindo", "Seguindo"], ["paravoce", "Para Você"]].map(([id, label]) => (
+          <button key={id} onClick={() => setSubTab(id)} style={{
+            flex: 1, padding: "9px 4px", borderRadius: 9, border: "none", cursor: "pointer",
+            background: subTab === id ? T.flame : "transparent", color: subTab === id ? "#1B0D06" : T.steel,
+            fontFamily: "Inter", fontWeight: 700, fontSize: 12.5,
+          }}>{label}</button>
+        ))}
+      </div>
+
+      <button onClick={() => setShowComposer(true)} style={{ width: "100%", padding: "12px 16px", borderRadius: 14, border: `1px dashed ${T.line}`, background: T.surface, color: T.steel, fontFamily: "Inter", fontWeight: 600, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginBottom: 16 }}>
+        <Camera size={15} /> Nova publicação
+      </button>
+
+      {loading ? (
+        <div style={{ display: "flex", justifyContent: "center", padding: 30 }}><Spinner size={22} /></div>
+      ) : posts.length === 0 ? (
+        <EmptyState text={subTab === "seguindo" ? "Você ainda não segue ninguém. Vá em 'Para Você' pra descobrir gente." : "Nada por aqui ainda. Seja o primeiro a publicar!"} />
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {posts.map((post) => (
+            <PostCard
+              key={post.id} post={post} author={profilesById[post.user_id] || { id: post.user_id, nome: "Atleta" }}
+              communityName={post.community_id ? communitiesById[post.community_id] : null}
+              liked={!!likesByPost[post.id]?.has(userId)} likeCount={likesByPost[post.id]?.size || 0}
+              comments={commentsByPost[post.id] || []} currentUserId={userId} commentAuthors={profilesById}
+              following={followingIds.has(post.user_id)} onToggleFollow={toggleFollow} onRepost={repost} onDelete={deletePost}
+              onToggleLike={toggleLike} onAddComment={addComment} onOpenProfile={onOpenProfile}
+            />
+          ))}
+          <div ref={sentinelRef} style={{ height: 1 }} />
+          {loadingMore && <div style={{ display: "flex", justifyContent: "center", padding: 16 }}><Spinner size={18} /></div>}
+          {!hasMore && posts.length > 0 && <div style={{ textAlign: "center", color: T.steelDim, fontFamily: "Inter", fontSize: 11.5, padding: 10 }}>Você chegou ao fim</div>}
+        </div>
+      )}
+
+      {showComposer && <GlobalPostComposer token={token} onClose={() => setShowComposer(false)} onSubmit={handleNewPost} />}
+    </div>
+  );
+}
+
+function GlobalPostComposer({ token, onClose, onSubmit }) {
+  const [content, setContent] = useState("");
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+
+  function pickFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFile(f);
+    setPreview(URL.createObjectURL(f));
+  }
+  async function submit() {
+    if (!content.trim() && !file) return;
+    setLoading(true); setErr("");
+    try {
+      let imageUrl = null;
+      if (file) {
+        const path = `global/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, "")}`;
+        imageUrl = await sbUploadFile("post-images", token, path, file);
+      }
+      await onSubmit({ content: content.trim(), imageUrl });
+      onClose();
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <Sheet onClose={onClose}>
+      <div style={{ fontFamily: "Bebas Neue", fontSize: 20, color: T.ink, marginBottom: 4 }}>Nova publicação</div>
+      <div style={{ color: T.steel, fontSize: 12.5, marginBottom: 14 }}>Tire uma foto ou escolha da galeria — vai pro Feed Global.</div>
+      {preview ? (
+        <div style={{ position: "relative", marginBottom: 12 }}>
+          <img src={preview} alt="" style={{ width: "100%", borderRadius: 14, maxHeight: 260, objectFit: "cover" }} />
+          <button onClick={() => { setFile(null); setPreview(null); }} style={{ position: "absolute", top: 8, right: 8, width: 26, height: 26, borderRadius: "50%", border: "none", background: "rgba(0,0,0,0.6)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><X size={13} /></button>
+        </div>
+      ) : (
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <label style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6, padding: 18, borderRadius: 14, border: `1.5px dashed ${T.line}`, color: T.steel, fontFamily: "Inter", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+            <Camera size={20} /> Câmera
+            <input type="file" accept="image/*" capture="environment" onChange={pickFile} style={{ display: "none" }} />
+          </label>
+          <label style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6, padding: 18, borderRadius: 14, border: `1.5px dashed ${T.line}`, color: T.steel, fontFamily: "Inter", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+            <ImageIcon size={20} /> Galeria
+            <input type="file" accept="image/*" onChange={pickFile} style={{ display: "none" }} />
+          </label>
+        </div>
+      )}
+      <textarea value={content} onChange={(e) => setContent(e.target.value)} placeholder="Seu comentário sobre o treino, dieta ou shape..." style={{
+        width: "100%", minHeight: 80, padding: 12, borderRadius: 12, border: `1px solid ${T.line}`, background: T.surface2,
+        color: T.ink, fontFamily: "Inter", fontSize: 13.5, resize: "none", marginBottom: 14,
+      }} />
+      <ErrorBox msg={err} />
+      <button disabled={loading || (!content.trim() && !file)} onClick={submit} style={{
+        width: "100%", padding: 14, borderRadius: 12, border: "none", cursor: loading ? "default" : "pointer",
+        background: (content.trim() || file) ? `linear-gradient(90deg, ${T.flame}, ${T.flame2})` : T.surface2,
+        color: (content.trim() || file) ? "#1B0D06" : T.steelDim, fontFamily: "Bebas Neue", fontSize: 16, letterSpacing: 1,
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+      }}>{loading ? <Spinner size={16} color="#1B0D06" /> : "PUBLICAR"}</button>
+    </Sheet>
+  );
+}
+
+function CommunityBubble({ post, author, mine, liked, likeCount, onToggleLike, onAuthorClick, onLongPress }) {
+  const timerRef = React.useRef(null);
+  function startPress() { timerRef.current = setTimeout(() => onLongPress(post), 480); }
+  function cancelPress() { if (timerRef.current) clearTimeout(timerRef.current); }
+
+  if (post.is_deleted) {
+    return (
+      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}
+        style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "78%", padding: "9px 13px", borderRadius: 14, background: T.surface2, color: T.steelDim, fontFamily: "Inter", fontSize: 12.5, fontStyle: "italic" }}>
+        🚫 Mensagem apagada
+      </motion.div>
+    );
+  }
+  return (
+    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}
+      onMouseDown={mine ? startPress : undefined} onMouseUp={mine ? cancelPress : undefined} onMouseLeave={mine ? cancelPress : undefined}
+      onTouchStart={mine ? startPress : undefined} onTouchEnd={mine ? cancelPress : undefined}
+      style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "78%", display: "flex", flexDirection: "column", gap: 3, userSelect: "none" }}>
+      {!mine && (
+        <button onClick={onAuthorClick} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", alignSelf: "flex-start" }}>
+          <span style={{ fontFamily: "Inter", fontSize: 10.5, color: T.steel, marginLeft: 4 }}>{author.nome || "Atleta"}</span>
+        </button>
+      )}
+      <div style={{ borderRadius: 14, background: mine ? T.flame : T.surface2, color: mine ? "#1B0D06" : T.ink, overflow: "hidden", cursor: mine ? "pointer" : "default" }}>
+        {post.type === "treino" && (
+          <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "7px 13px 0" }}>
+            <Flame size={11} color={mine ? "#1B0D06" : T.flame2} />
+            <span style={{ fontFamily: "Inter", fontSize: 9.5, fontWeight: 800, opacity: 0.85, letterSpacing: 0.3 }}>TREINO</span>
+          </div>
+        )}
+        {post.image_url && <img src={post.image_url} alt="" style={{ width: "100%", maxWidth: 220, display: "block", maxHeight: 220, objectFit: "cover" }} />}
+        {post.content && <div style={{ fontFamily: "Inter", fontSize: 13, padding: "8px 13px" }}>{post.content}</div>}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, alignSelf: mine ? "flex-end" : "flex-start", padding: "0 4px" }}>
+        <button onClick={() => onToggleLike(post)} style={{ background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 4, color: liked ? T.flame : T.steelDim }}>
+          <Heart size={12} fill={liked ? T.flame : "none"} /> {likeCount > 0 && <span style={{ fontFamily: "IBM Plex Mono", fontSize: 10 }}>{likeCount}</span>}
+        </button>
+        {post.is_edited && <span style={{ fontFamily: "Inter", fontSize: 9, color: T.steelDim }}>(editado)</span>}
+        <span style={{ fontFamily: "Inter", fontSize: 9, color: T.steelDim }}>{fmtTime(post.created_at)}</span>
+      </div>
+    </motion.div>
+  );
+}
+
+function FeedScreen({ userId, token, myProfile, community, onBack, onOpenMessages, onOpenProfile, hasUnreadDM }) {
+  const [posts, setPosts] = useState([]);
+  const [profilesById, setProfilesById] = useState({});
+  const [likesByPost, setLikesByPost] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [text, setText] = useState("");
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [sending, setSending] = useState(false);
+  const [err, setErr] = useState("");
+  const [menuPost, setMenuPost] = useState(null);
+  const [editingPost, setEditingPost] = useState(null);
+  const [editText, setEditText] = useState("");
+  const bottomRef = React.useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [p, l] = await Promise.all([
+          sbSelect("posts", token, `community_id=eq.${community.id}&select=*&order=created_at.asc&limit=100`),
+          sbSelect("likes", token, "select=*"),
+        ]);
+        setPosts(p);
+        const uids = [...new Set(p.map((x) => x.user_id))];
+        if (uids.length) {
+          const profs = await sbSelect("public_profiles", token, `id=in.(${uids.join(",")})&select=*`);
+          setProfilesById(Object.fromEntries(profs.map((pr) => [pr.id, pr])));
+        }
+        const lm = {}; l.forEach((x) => { (lm[x.post_id] ||= new Set()).add(x.user_id); }); setLikesByPost(lm);
+        sbUpsert("community_reads", token, [{ user_id: userId, community_id: community.id, last_read_at: new Date().toISOString() }], "user_id,community_id").catch(() => {});
+      } catch (e) { /* vazio */ }
+      finally { setLoading(false); }
+    })();
+
+    const channel = supabaseRealtime
+      .channel(`community-${community.id}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "posts", filter: `community_id=eq.${community.id}` }, async (payload) => {
+        setPosts((prev) => prev.some((p) => p.id === payload.new.id) ? prev : [...prev, payload.new]);
+        setProfilesById((prev) => {
+          if (prev[payload.new.user_id]) return prev;
+          sbSelect("public_profiles", token, `id=eq.${payload.new.user_id}&select=*`).then((r) => { if (r[0]) setProfilesById((p) => ({ ...p, [r[0].id]: r[0] })); }).catch(() => {});
+          return prev;
+        });
+      })
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "posts", filter: `community_id=eq.${community.id}` }, (payload) => {
+        setPosts((prev) => prev.map((p) => p.id === payload.new.id ? payload.new : p));
+      })
+      .subscribe();
+    return () => supabaseRealtime.removeChannel(channel);
+  }, [community.id, token, userId]);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [posts.length]);
+
+  function pickFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFile(f);
+    setPreview(URL.createObjectURL(f));
+  }
+
+  async function send() {
+    const content = text.trim();
+    if (!content && !file) return;
+    setSending(true); setErr("");
+    try {
+      let imageUrl = null;
+      if (file) {
+        const path = `${userId}/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, "")}`;
+        imageUrl = await sbUploadFile("post-images", token, path, file);
+      }
+      const created = await sbInsert("posts", token, [{ user_id: userId, community_id: community.id, content, image_url: imageUrl, type: "foto" }]);
+      setPosts((p) => [...p, created[0]]);
+      setProfilesById((p) => ({ ...p, [userId]: myProfile }));
+      setText(""); setFile(null); setPreview(null);
+    } catch (e) { setErr(e.message); }
+    finally { setSending(false); }
+  }
+
+  async function toggleLike(post) {
+    const already = likesByPost[post.id]?.has(userId);
+    setLikesByPost((prev) => { const next = new Set(prev[post.id] || []); already ? next.delete(userId) : next.add(userId); return { ...prev, [post.id]: next }; });
+    try {
+      if (already) await sbDelete("likes", token, `post_id=eq.${post.id}&user_id=eq.${userId}`);
+      else await sbInsert("likes", token, [{ post_id: post.id, user_id: userId }]);
+    } catch (e) { /* silencioso */ }
+  }
+
+  function startEdit(post) { setEditingPost(post); setEditText(post.content || ""); setMenuPost(null); }
+  async function confirmEdit() {
+    const content = editText.trim();
+    if (!content || content === editingPost.content) { setEditingPost(null); return; }
+    setPosts((prev) => prev.map((p) => p.id === editingPost.id ? { ...p, content, is_edited: true } : p));
+    const id = editingPost.id;
+    setEditingPost(null);
+    try { await sbUpdate("posts", token, `id=eq.${id}`, { content, is_edited: true }); } catch (e) { /* mantém local */ }
+  }
+  async function deleteMessage(post) {
+    setMenuPost(null);
+    setPosts((prev) => prev.map((p) => p.id === post.id ? { ...p, is_deleted: true, content: "" } : p));
+    try { await sbUpdate("posts", token, `id=eq.${post.id}`, { is_deleted: true, content: "" }); } catch (e) { /* mantém local */ }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <button onClick={onBack} style={{ width: 34, height: 34, borderRadius: "50%", border: `1px solid ${T.line}`, background: T.surface, color: T.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}><ArrowLeft size={16} /></button>
+        <div style={{ fontFamily: "Bebas Neue", fontSize: 18, color: T.ink, textAlign: "center", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{community.nome}</div>
+        <button onClick={onOpenMessages} style={{ position: "relative", width: 34, height: 34, borderRadius: "50%", border: `1px solid ${T.line}`, background: T.surface, color: T.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}>
+          <MessageCircle size={16} />
+          {hasUnreadDM && <span style={{ position: "absolute", top: -2, right: -2, width: 10, height: 10, borderRadius: "50%", background: T.red, border: `2px solid ${T.bg}` }} />}
+        </button>
+      </div>
+
+      <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 14, padding: "4px 2px 96px", minHeight: 200 }}>
+        {loading ? <div style={{ display: "flex", justifyContent: "center", padding: 20 }}><Spinner size={20} /></div>
+          : posts.length === 0 ? <EmptyState text="Nenhuma mensagem ainda nessa comunidade. Comece a conversa!" />
+          : (
+            <AnimatePresence initial={false}>
+              {posts.map((post) => (
+                <CommunityBubble
+                  key={post.id} post={post} author={profilesById[post.user_id] || { nome: "Atleta" }} mine={post.user_id === userId}
+                  liked={!!likesByPost[post.id]?.has(userId)} likeCount={likesByPost[post.id]?.size || 0}
+                  onToggleLike={toggleLike} onAuthorClick={() => onOpenProfile(profilesById[post.user_id] || { id: post.user_id, nome: "Atleta" })}
+                  onLongPress={setMenuPost}
+                />
+              ))}
+            </AnimatePresence>
+          )}
+        <div ref={bottomRef} />
+      </div>
+
+      <div style={{
+        position: "fixed", bottom: 74, left: "50%", transform: "translateX(-50%)",
+        width: "100%", maxWidth: 430, boxSizing: "border-box", zIndex: 40,
+        background: hexToRgba(T.bg, 0.92), backdropFilter: "blur(10px)", borderTop: `1px solid ${T.line}`,
+        padding: "8px 18px calc(8px + env(safe-area-inset-bottom, 0px))",
+      }}>
+        <ErrorBox msg={err} />
+        {preview && (
+          <div style={{ position: "relative", marginBottom: 8, alignSelf: "flex-start", width: 64 }}>
+            <img src={preview} alt="" style={{ width: 64, height: 64, borderRadius: 10, objectFit: "cover" }} />
+            <button onClick={() => { setFile(null); setPreview(null); }} style={{ position: "absolute", top: -6, right: -6, width: 20, height: 20, borderRadius: "50%", border: "none", background: T.red, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><X size={11} /></button>
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+          <label style={{ width: 38, height: 38, borderRadius: "50%", border: `1px solid ${T.line}`, background: T.surface2, color: T.steel, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}>
+            <Camera size={15} />
+            <input type="file" accept="image/*" onChange={pickFile} style={{ display: "none" }} />
+          </label>
+          <ChatTextarea value={text} onChange={setText} onSend={send} />
+          <button disabled={sending} onClick={send} style={{ width: 40, height: 40, borderRadius: "50%", border: "none", background: T.flame, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}>
+            {sending ? <Spinner size={15} color="#fff" /> : <Send size={15} />}
+          </button>
+        </div>
+      </div>
+
+      {menuPost && !menuPost.is_deleted && (
+        <Sheet onClose={() => setMenuPost(null)}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <button onClick={() => startEdit(menuPost)} style={{ padding: 14, borderRadius: 12, border: `1px solid ${T.line}`, background: T.surface2, color: T.ink, fontFamily: "Inter", fontWeight: 700, fontSize: 13.5, cursor: "pointer", textAlign: "left" }}>Editar mensagem</button>
+            <button onClick={() => deleteMessage(menuPost)} style={{ padding: 14, borderRadius: 12, border: `1px solid ${T.red}`, background: hexToRgba(T.red, 0.08), color: T.red, fontFamily: "Inter", fontWeight: 700, fontSize: 13.5, cursor: "pointer", textAlign: "left" }}>Apagar mensagem</button>
+          </div>
+        </Sheet>
+      )}
+      {editingPost && (
+        <Sheet onClose={() => setEditingPost(null)}>
+          <div style={{ fontFamily: "Bebas Neue", fontSize: 18, color: T.ink, marginBottom: 12 }}>Editar mensagem</div>
+          <textarea value={editText} onChange={(e) => setEditText(e.target.value)} style={{ width: "100%", minHeight: 70, padding: 12, borderRadius: 12, border: `1px solid ${T.line}`, background: T.surface2, color: T.ink, fontFamily: "Inter", fontSize: 13.5, resize: "none", marginBottom: 12 }} />
+          <button onClick={confirmEdit} style={{ width: "100%", padding: 14, borderRadius: 12, border: "none", cursor: "pointer", background: T.flame, color: "#1B0D06", fontFamily: "Bebas Neue", fontSize: 16, letterSpacing: 1 }}>SALVAR</button>
+        </Sheet>
+      )}
+    </div>
+  );
+}
+function SwipeRow({ id, swiped, onSwipe, onDelete, children }) {
+  return (
+    <div style={{ position: "relative", overflow: "hidden", borderRadius: 16 }}>
+      <div style={{ position: "absolute", inset: 0, display: "flex", justifyContent: "flex-end", alignItems: "stretch" }}>
+        <button onClick={() => onDelete(id)} style={{ width: 70, border: "none", background: T.red, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", borderRadius: 16 }}>
+          <X size={18} />
+        </button>
+      </div>
+      <motion.div
+        drag="x" dragConstraints={{ left: -70, right: 0 }} dragElastic={0.05}
+        animate={{ x: swiped ? -70 : 0 }} transition={{ type: "spring", stiffness: 420, damping: 38 }}
+        onDragEnd={(e, info) => onSwipe(id, info.offset.x < -40)}
+        style={{ touchAction: "pan-y", position: "relative", zIndex: 1 }}
+      >
+        {children}
+      </motion.div>
+    </div>
+  );
+}
+
+function ChatListScreen({ userId, token, onlineIds, onBack, onOpenChat }) {
+  const [chats, setChats] = useState([]);
+  const [profilesById, setProfilesById] = useState({});
+  const [previews, setPreviews] = useState({}); // chatId -> { content, unread, hasImage, time }
+  const [hiddenIds, setHiddenIds] = useState(new Set());
+  const [swipedId, setSwipedId] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [rows, prefs] = await Promise.all([
+          sbSelect("chats", token, `or=(user_a.eq.${userId},user_b.eq.${userId})&select=*&order=created_at.desc`),
+          sbSelect("chat_prefs", token, `user_id=eq.${userId}&hidden=eq.true&select=chat_id`),
+        ]);
+        setChats(rows);
+        setHiddenIds(new Set(prefs.map((p) => p.chat_id)));
+        const otherIds = rows.map((c) => c.user_a === userId ? c.user_b : c.user_a);
+        if (otherIds.length) {
+          const profs = await sbSelect("public_profiles", token, `id=in.(${otherIds.join(",")})&select=*`);
+          setProfilesById(Object.fromEntries(profs.map((p) => [p.id, p])));
+        }
+        if (rows.length) {
+          const chatIds = rows.map((c) => c.id).join(",");
+          const msgs = await sbSelect("messages", token, `chat_id=in.(${chatIds})&select=*&order=created_at.desc&limit=500`);
+          const prev = {};
+          rows.forEach((c) => {
+            const doChat = msgs.filter((m) => m.chat_id === c.id);
+            const last = doChat[0];
+            const unread = doChat.filter((m) => m.sender_id !== userId && !m.lida).length;
+            prev[c.id] = { content: last?.content || "", hasImage: !!last?.image_url, unread, time: last?.created_at };
+          });
+          setPreviews(prev);
+        }
+      } catch (e) { /* lista vazia */ }
+      finally { setLoading(false); }
+    })();
+  }, [userId, token]);
+
+  async function handleDelete(chatId) {
+    setHiddenIds((s) => new Set([...s, chatId]));
+    setSwipedId(null);
+    try { await sbUpsert("chat_prefs", token, [{ user_id: userId, chat_id: chatId, hidden: true }], "user_id,chat_id"); } catch (e) { /* mantém oculto localmente */ }
+  }
+
+  const visibleChats = chats
+    .filter((c) => !hiddenIds.has(c.id))
+    .sort((a, b) => {
+      const pa = previews[a.id] || {}, pb = previews[b.id] || {};
+      if (!!pa.unread !== !!pb.unread) return pb.unread ? 1 : -1; // não lidas primeiro
+      return new Date(pb.time || b.created_at) - new Date(pa.time || a.created_at);
+    });
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+        <button onClick={onBack} style={{ width: 34, height: 34, borderRadius: "50%", border: `1px solid ${T.line}`, background: T.surface, color: T.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><ArrowLeft size={16} /></button>
+        <div style={{ fontFamily: "Bebas Neue", fontSize: 22, color: T.ink }}>Mensagens</div>
+      </div>
+      {loading ? <div style={{ display: "flex", justifyContent: "center", padding: 30 }}><Spinner size={22} /></div>
+        : visibleChats.length === 0 ? <EmptyState text="Nenhuma conversa ainda. Toque no nome de alguém pra começar." />
+        : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {visibleChats.map((c) => {
+              const otherId = c.user_a === userId ? c.user_b : c.user_a;
+              const other = profilesById[otherId] || { nome: "Atleta" };
+              const preview = previews[c.id] || { content: "", unread: 0 };
+              const isOnline = onlineIds?.has(otherId);
+              return (
+                <SwipeRow key={c.id} id={c.id} swiped={swipedId === c.id} onSwipe={(id, isOpen) => setSwipedId(isOpen ? id : null)} onDelete={handleDelete}>
+                  <Card className="card-fx" onClick={() => onOpenChat({ id: c.id, otherId, otherName: other.nome })} style={{ display: "flex", alignItems: "center", gap: 12, cursor: "pointer", padding: 12 }}>
+                    <div style={{ position: "relative", flexShrink: 0 }}>
+                      {other.avatar_url ? <img src={other.avatar_url} alt="" style={{ width: 40, height: 40, borderRadius: "50%", objectFit: "cover" }} /> : <div style={{ width: 40, height: 40, borderRadius: "50%", background: T.surface2, display: "flex", alignItems: "center", justifyContent: "center" }}><User size={18} color={T.steelDim} /></div>}
+                      {isOnline && <span style={{ position: "absolute", bottom: -1, right: -1, width: 11, height: 11, borderRadius: "50%", background: "#3EC46D", border: `2px solid ${T.bg}` }} />}
+                      {preview.unread > 0 && (
+                        <span style={{ position: "absolute", top: -3, right: -3, minWidth: 16, height: 16, padding: "0 3px", borderRadius: 999, background: T.red, color: "#fff", fontFamily: "Inter", fontWeight: 800, fontSize: 9.5, display: "flex", alignItems: "center", justifyContent: "center", border: `2px solid ${T.bg}` }}>
+                          {preview.unread > 9 ? "9+" : preview.unread}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ fontFamily: "Inter", fontWeight: preview.unread > 0 ? 800 : 700, fontSize: 13.5, color: T.ink }}>{other.nome || "Atleta"}</div>
+                      {(preview.content || preview.hasImage) && (
+                        <div style={{ fontFamily: "Inter", fontSize: 11.5, color: preview.unread > 0 ? T.ink : T.steelDim, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginTop: 2, display: "flex", alignItems: "center", gap: 4 }}>
+                          {preview.hasImage && !preview.content && <><ImageIcon size={11} /> Foto</>}
+                          {preview.content}
+                        </div>
+                      )}
+                    </div>
+                    {preview.time && <span style={{ fontFamily: "Inter", fontSize: 10, color: T.steelDim, flexShrink: 0 }}>{new Date(preview.time).toDateString() === new Date().toDateString() ? fmtTime(preview.time) : dateDividerLabel(preview.time)}</span>}
+                  </Card>
+                </SwipeRow>
+              );
+            })}
+          </div>
+        )}
+    </div>
+  );
+}
+
+function fmtTime(iso) { return new Date(iso).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }); }
+function dateDividerLabel(iso) {
+  const d = new Date(iso), today = new Date(), yest = new Date(); yest.setDate(today.getDate() - 1);
+  const same = (a, b) => a.toDateString() === b.toDateString();
+  if (same(d, today)) return "Hoje";
+  if (same(d, yest)) return "Ontem";
+  return d.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit", year: d.getFullYear() !== today.getFullYear() ? "numeric" : undefined });
+}
+
+function ChatTextarea({ value, onChange, onSend }) {
+  const ref = React.useRef(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 120) + "px";
+  }, [value]);
+  return (
+    <textarea
+      ref={ref} value={value} rows={1}
+      onChange={(e) => onChange(e.target.value)}
+      onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSend(); } }}
+      placeholder="Digite uma mensagem..."
+      style={{
+        flex: 1, padding: "10px 16px", borderRadius: 20, border: "none", background: T.surface2, color: T.ink,
+        fontFamily: "Inter", fontSize: 13.5, resize: "none", overflowY: "auto", maxHeight: 120, lineHeight: 1.4,
+      }}
+    />
+  );
+}
+
+function MessageBubble({ m, mine, isLastInGroup, onLongPress }) {
+  const timerRef = React.useRef(null);
+  function startPress() { timerRef.current = setTimeout(() => onLongPress(m), 480); }
+  function cancelPress() { if (timerRef.current) clearTimeout(timerRef.current); }
+
+  if (m.is_deleted) {
+    return (
+      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}
+        style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "75%", padding: "9px 13px", borderRadius: 16, background: T.surface2, color: T.steelDim, fontFamily: "Inter", fontSize: 12.5, fontStyle: "italic" }}>
+        🚫 Mensagem apagada
+      </motion.div>
+    );
+  }
+  const tailRadius = 4;
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}
+      onMouseDown={mine ? startPress : undefined} onMouseUp={mine ? cancelPress : undefined} onMouseLeave={mine ? cancelPress : undefined}
+      onTouchStart={mine ? startPress : undefined} onTouchEnd={mine ? cancelPress : undefined}
+      style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "75%", display: "flex", flexDirection: "column", gap: 2, userSelect: "none" }}
+    >
+      <div style={{
+        borderRadius: 16,
+        borderBottomRightRadius: mine && isLastInGroup ? tailRadius : 16,
+        borderBottomLeftRadius: !mine && isLastInGroup ? tailRadius : 16,
+        background: mine ? T.flame : T.surface2, color: mine ? "#fff" : T.ink, overflow: "hidden", cursor: mine ? "pointer" : "default",
+      }}>
+        {m.image_url && <img src={m.image_url} alt="" style={{ width: "100%", maxWidth: 200, display: "block", maxHeight: 220, objectFit: "cover" }} />}
+        {m.content && <div style={{ padding: "9px 13px", fontFamily: "Inter", fontSize: 13 }}>{m.content}</div>}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 4, alignSelf: mine ? "flex-end" : "flex-start", padding: "0 3px" }}>
+        {m.is_edited && <span style={{ fontFamily: "Inter", fontSize: 9.5, color: T.steelDim }}>(editado)</span>}
+        <span style={{ fontFamily: "Inter", fontSize: 9.5, color: T.steelDim }}>{fmtTime(m.created_at)}</span>
+        {mine && (
+          m.lida
+            ? <span style={{ display: "flex" }}><Check size={11} color={T.blue} style={{ marginRight: -6 }} /><Check size={11} color={T.blue} /></span>
+            : <Check size={11} color={T.steelDim} />
+        )}
+      </div>
+    </motion.div>
+  );
+}
+
+function ChatScreen({ chat, userId, token, myNome, onBack }) {
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState("");
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [menuMsg, setMenuMsg] = useState(null);
+  const [editingMsg, setEditingMsg] = useState(null);
+  const [editText, setEditText] = useState("");
+  const bottomRef = React.useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const rows = await sbSelect("messages", token, `chat_id=eq.${chat.id}&select=*&order=created_at.asc&limit=200`);
+        setMessages(rows);
+        // marca como lidas todas as mensagens recebidas (não enviadas por mim) ao abrir o chat
+        const naoLidas = rows.some((m) => m.sender_id !== userId && !m.lida);
+        if (naoLidas) sbUpdate("messages", token, `chat_id=eq.${chat.id}&sender_id=neq.${userId}&lida=eq.false`, { lida: true, read_at: new Date().toISOString() }).catch(() => {});
+      } catch (e) { /* vazio */ }
+      finally { setLoading(false); }
+    })();
+
+    // Supabase Realtime: ouve inserções E atualizações nesse chat (novas mensagens, "visto", edição, apagar)
+    const channel = supabaseRealtime
+      .channel(`chat-${chat.id}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: `chat_id=eq.${chat.id}` }, (payload) => {
+        setMessages((prev) => prev.some((m) => m.id === payload.new.id) ? prev : [...prev, payload.new]);
+        if (payload.new.sender_id !== userId) sbUpdate("messages", token, `id=eq.${payload.new.id}`, { lida: true, read_at: new Date().toISOString() }).catch(() => {});
+      })
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "messages", filter: `chat_id=eq.${chat.id}` }, (payload) => {
+        setMessages((prev) => prev.map((m) => m.id === payload.new.id ? payload.new : m));
+      })
+      .subscribe();
+    return () => supabaseRealtime.removeChannel(channel);
+  }, [chat.id, token]);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages.length]);
+
+  const renderItems = useMemo(() => {
+    const items = [];
+    let lastDateStr = null;
+    messages.forEach((m, i) => {
+      const dateStr = new Date(m.created_at).toDateString();
+      if (dateStr !== lastDateStr) { items.push({ type: "divider", key: `d-${dateStr}-${i}`, label: dateDividerLabel(m.created_at) }); lastDateStr = dateStr; }
+      const next = messages[i + 1];
+      const isLastInGroup = !next || next.sender_id !== m.sender_id || new Date(next.created_at).toDateString() !== dateStr;
+      items.push({ type: "msg", key: m.id, m, isLastInGroup });
+    });
+    return items;
+  }, [messages]);
+
+  function pickFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFile(f);
+    setPreview(URL.createObjectURL(f));
+  }
+
+  // UI otimista: a mensagem aparece na hora, antes mesmo da resposta do banco
+  async function send() {
+    const content = text.trim();
+    if (!content && !file) return;
+    setText("");
+    const tempId = `temp-${Date.now()}`;
+    let imageUrl = null;
+    try {
+      if (file) {
+        const path = `${userId}/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, "")}`;
+        imageUrl = await sbUploadFile("post-images", token, path, file);
+      }
+      setFile(null); setPreview(null);
+      setMessages((prev) => [...prev, { id: tempId, chat_id: chat.id, sender_id: userId, content, image_url: imageUrl, created_at: new Date().toISOString(), lida: false }]);
+      const created = await sbInsert("messages", token, [{ chat_id: chat.id, sender_id: userId, receiver_id: chat.otherId, content, image_url: imageUrl }]);
+      setMessages((prev) => prev.map((m) => m.id === tempId ? created[0] : m));
+    } catch (e) {
+      setMessages((prev) => prev.filter((m) => m.id !== tempId));
+    }
+  }
+
+  function startEdit(m) { setEditingMsg(m); setEditText(m.content); setMenuMsg(null); }
+  async function confirmEdit() {
+    const content = editText.trim();
+    if (!content || content === editingMsg.content) { setEditingMsg(null); return; }
+    setMessages((prev) => prev.map((m) => m.id === editingMsg.id ? { ...m, content, is_edited: true } : m));
+    const id = editingMsg.id;
+    setEditingMsg(null);
+    try { await sbUpdate("messages", token, `id=eq.${id}`, { content, is_edited: true }); } catch (e) { /* mantém local */ }
+  }
+  async function deleteMessage(m) {
+    setMenuMsg(null);
+    setMessages((prev) => prev.map((x) => x.id === m.id ? { ...x, is_deleted: true, content: "" } : x));
+    try { await sbUpdate("messages", token, `id=eq.${m.id}`, { is_deleted: true }); } catch (e) { /* mantém local */ }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <div style={{
+        display: "flex", alignItems: "center", gap: 10, marginBottom: 14, position: "sticky", top: 0, zIndex: 5,
+        background: hexToRgba(T.bg, 0.75), backdropFilter: "blur(10px)", padding: "4px 0",
+      }}>
+        <button onClick={onBack} style={{ width: 34, height: 34, borderRadius: "50%", border: `1px solid ${T.line}`, background: T.surface, color: T.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><ArrowLeft size={16} /></button>
+        <div style={{ fontFamily: "Bebas Neue", fontSize: 20, color: T.ink }}>{chat.otherName}</div>
+      </div>
+
+      <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6, marginBottom: 12, minHeight: 200, paddingBottom: 96 }}>
+        {loading ? <div style={{ display: "flex", justifyContent: "center", padding: 20 }}><Spinner size={20} /></div>
+          : (
+            <AnimatePresence initial={false}>
+              {renderItems.map((item) => item.type === "divider" ? (
+                <div key={item.key} style={{ display: "flex", justifyContent: "center", margin: "10px 0" }}>
+                  <span style={{ fontFamily: "Inter", fontSize: 10.5, fontWeight: 700, color: T.steelDim, background: T.surface2, padding: "4px 12px", borderRadius: 999 }}>{item.label}</span>
+                </div>
+              ) : (
+                <div key={item.key} style={{ marginBottom: item.isLastInGroup ? 8 : 2, display: "flex", flexDirection: "column" }}>
+                  <MessageBubble m={item.m} mine={item.m.sender_id === userId} isLastInGroup={item.isLastInGroup} onLongPress={setMenuMsg} />
+                </div>
+              ))}
+            </AnimatePresence>
+          )}
+        <div ref={bottomRef} />
+      </div>
+
+      {/* barra de digitação fixa, ancorada acima da bottom nav do app
+          (nav ocupa ~72px), alinhada com a coluna central do app */}
+      <div style={{
+        position: "fixed", bottom: 74, left: "50%", transform: "translateX(-50%)",
+        width: "100%", maxWidth: 430, boxSizing: "border-box", zIndex: 40,
+        background: hexToRgba(T.bg, 0.92), backdropFilter: "blur(10px)", borderTop: `1px solid ${T.line}`,
+        padding: "8px 18px calc(8px + env(safe-area-inset-bottom, 0px))",
+      }}>
+        {preview && (
+          <div style={{ position: "relative", marginBottom: 8, alignSelf: "flex-start", width: 64 }}>
+            <img src={preview} alt="" style={{ width: 64, height: 64, borderRadius: 10, objectFit: "cover" }} />
+            <button onClick={() => { setFile(null); setPreview(null); }} style={{ position: "absolute", top: -6, right: -6, width: 20, height: 20, borderRadius: "50%", border: "none", background: T.red, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><X size={11} /></button>
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+          <label style={{ width: 38, height: 38, borderRadius: "50%", border: `1px solid ${T.line}`, background: T.surface2, color: T.steel, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}>
+            <Link2 size={15} />
+            <input type="file" accept="image/*" onChange={pickFile} style={{ display: "none" }} />
+          </label>
+          <ChatTextarea value={text} onChange={setText} onSend={send} />
+          <button onClick={send} style={{ width: 40, height: 40, borderRadius: "50%", border: "none", background: T.flame, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}><Send size={15} /></button>
+        </div>
+      </div>
+
+      {menuMsg && !menuMsg.is_deleted && (
+        <Sheet onClose={() => setMenuMsg(null)}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <button onClick={() => startEdit(menuMsg)} style={{ padding: 14, borderRadius: 12, border: `1px solid ${T.line}`, background: T.surface2, color: T.ink, fontFamily: "Inter", fontWeight: 700, fontSize: 13.5, cursor: "pointer", textAlign: "left" }}>Editar mensagem</button>
+            <button onClick={() => deleteMessage(menuMsg)} style={{ padding: 14, borderRadius: 12, border: `1px solid ${T.red}`, background: hexToRgba(T.red, 0.08), color: T.red, fontFamily: "Inter", fontWeight: 700, fontSize: 13.5, cursor: "pointer", textAlign: "left" }}>Apagar mensagem</button>
+          </div>
+        </Sheet>
+      )}
+
+      {editingMsg && (
+        <Sheet onClose={() => setEditingMsg(null)}>
+          <div style={{ fontFamily: "Bebas Neue", fontSize: 18, color: T.ink, marginBottom: 12 }}>Editar mensagem</div>
+          <textarea value={editText} onChange={(e) => setEditText(e.target.value)} style={{ width: "100%", minHeight: 70, padding: 12, borderRadius: 12, border: `1px solid ${T.line}`, background: T.surface2, color: T.ink, fontFamily: "Inter", fontSize: 13.5, resize: "none", marginBottom: 12 }} />
+          <button onClick={confirmEdit} style={{ width: "100%", padding: 14, borderRadius: 12, border: "none", cursor: "pointer", background: T.flame, color: "#1B0D06", fontFamily: "Bebas Neue", fontSize: 16, letterSpacing: 1 }}>SALVAR</button>
+        </Sheet>
+      )}
+    </div>
+  );
+}
+
+function CommunityDiscoveryScreen({ userId, token, onOpenMessages, onEnterCommunity, refreshKey, myProfile, hasUnreadDM }) {
+  const [communities, setCommunities] = useState([]);
+  const [myMemberships, setMyMemberships] = useState(new Set());
+  const [unreadByCommunity, setUnreadByCommunity] = useState({}); // id -> boolean
+  const [loading, setLoading] = useState(true);
+  const [joining, setJoining] = useState(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [localRefresh, setLocalRefresh] = useState(0);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [all, mine, reads] = await Promise.all([
+          sbSelect("communities", token, "select=*&order=created_at.asc"),
+          sbSelect("community_members", token, `user_id=eq.${userId}&select=community_id`),
+          sbSelect("community_reads", token, `user_id=eq.${userId}&select=*`),
+        ]);
+        setCommunities(all);
+        const memberIds = mine.map((m) => m.community_id);
+        setMyMemberships(new Set(memberIds));
+        if (memberIds.length) {
+          const lastPosts = await sbSelect("posts", token, `community_id=in.(${memberIds.join(",")})&select=community_id,created_at&order=created_at.desc&limit=500`);
+          const readsMap = Object.fromEntries(reads.map((r) => [r.community_id, r.last_read_at]));
+          const lastByCommunity = {};
+          lastPosts.forEach((p) => { if (!lastByCommunity[p.community_id]) lastByCommunity[p.community_id] = p.created_at; });
+          const unread = {};
+          memberIds.forEach((id) => {
+            const last = lastByCommunity[id];
+            unread[id] = !!last && (!readsMap[id] || new Date(last) > new Date(readsMap[id]));
+          });
+          setUnreadByCommunity(unread);
+        }
+      } catch (e) { /* lista vazia */ }
+      finally { setLoading(false); }
+    })();
+  }, [userId, token, refreshKey, localRefresh]);
+
+  async function join(community) {
+    setJoining(community.id);
+    try {
+      await sbInsert("community_members", token, [{ user_id: userId, community_id: community.id }]);
+      setMyMemberships((s) => new Set([...s, community.id]));
+      onEnterCommunity(community);
+    } catch (e) { /* pode já ser membro; tenta entrar mesmo assim */ onEnterCommunity(community); }
+    finally { setJoining(null); }
+  }
+
+  async function handleCreated(community) {
+    setMyMemberships((s) => new Set([...s, community.id]));
+    setCommunities((c) => [...c, community]);
+    setShowCreate(false);
+    onEnterCommunity(community);
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+        <div style={{ fontFamily: "Bebas Neue", fontSize: 24, color: T.ink }}>Comunidade</div>
+        <button onClick={onOpenMessages} style={{ position: "relative", width: 36, height: 36, borderRadius: "50%", border: `1px solid ${T.line}`, background: T.surface, color: T.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+          <MessageCircle size={17} />
+          {hasUnreadDM && <span style={{ position: "absolute", top: -2, right: -2, width: 11, height: 11, borderRadius: "50%", background: T.red, border: `2px solid ${T.bg}` }} />}
+        </button>
+      </div>
+      <div style={{ fontFamily: "Inter", fontSize: 12.5, color: T.steel, marginBottom: 14 }}>Escolha um grupo com o seu foco e treine em boa companhia.</div>
+
+      <button onClick={() => setShowCreate(true)} style={{
+        width: "100%", padding: "12px 16px", borderRadius: 14, border: `1.5px dashed ${T.flame}`, background: hexToRgba(T.flame, 0.06),
+        color: T.flame2, fontFamily: "Inter", fontWeight: 700, fontSize: 13, cursor: "pointer",
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginBottom: 18,
+      }}><Plus size={15} /> Nova comunidade</button>
+
+      {loading ? <div style={{ display: "flex", justifyContent: "center", padding: 30 }}><Spinner size={22} /></div>
+        : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {communities.map((c) => {
+              const isMember = myMemberships.has(c.id);
+              const hasUnread = unreadByCommunity[c.id];
+              return (
+                <Card key={c.id} style={{ padding: 16, display: "flex", gap: 12, alignItems: "flex-start" }}>
+                  <div style={{ position: "relative", flexShrink: 0 }}>
+                    {c.capa_url ? (
+                      <img src={c.capa_url} alt="" style={{ width: 44, height: 44, borderRadius: 12, objectFit: "cover" }} />
+                    ) : (
+                      <div style={{ width: 44, height: 44, borderRadius: 12, background: T.surface2, display: "flex", alignItems: "center", justifyContent: "center" }}><Users size={18} color={T.steelDim} /></div>
+                    )}
+                    {hasUnread && (
+                      <span style={{ position: "absolute", top: -3, right: -3, width: 12, height: 12, borderRadius: "50%", background: T.red, border: `2px solid ${T.bg}` }} />
+                    )}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontFamily: "Inter", fontWeight: 700, fontSize: 15, color: T.ink, marginBottom: 4 }}>{c.nome}</div>
+                    {c.descricao && <div style={{ fontFamily: "Inter", fontSize: 12, color: T.steel, marginBottom: 12, lineHeight: 1.4 }}>{c.descricao}</div>}
+                    <button
+                      disabled={joining === c.id}
+                      onClick={() => isMember ? onEnterCommunity(c) : join(c)}
+                      style={{
+                        width: "100%", padding: "10px", borderRadius: 10, border: isMember ? `1px solid ${T.line}` : "none",
+                        cursor: "pointer", background: isMember ? T.surface2 : `linear-gradient(90deg, ${T.flame}, ${T.flame2})`,
+                        color: isMember ? T.ink : "#1B0D06", fontFamily: "Inter", fontWeight: 700, fontSize: 12.5,
+                        display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                      }}
+                    >
+                      {joining === c.id ? <Spinner size={13} color={isMember ? T.ink : "#1B0D06"} /> : isMember ? "Abrir comunidade" : "Entrar na comunidade"}
+                    </button>
+                  </div>
+                </Card>
+              );
+            })}
+          </div>
+        )}
+
+      {showCreate && <CreateCommunityModal userId={userId} token={token} onClose={() => setShowCreate(false)} onCreated={handleCreated} />}
+    </div>
+  );
+}
+
+function CreateCommunityModal({ userId, token, onClose, onCreated }) {
+  const [nome, setNome] = useState("");
+  const [descricao, setDescricao] = useState("");
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+
+  function pickFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFile(f);
+    setPreview(URL.createObjectURL(f));
+  }
+
+  async function submit() {
+    if (!nome.trim()) return;
+    setLoading(true); setErr("");
+    try {
+      let capaUrl = null;
+      if (file) {
+        const path = `covers/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, "")}`;
+        capaUrl = await sbUploadFile("post-images", token, path, file);
+      }
+      const created = await sbInsert("communities", token, [{ nome: nome.trim(), descricao: descricao.trim() || null, capa_url: capaUrl }]);
+      const community = created[0];
+      await sbInsert("community_members", token, [{ user_id: userId, community_id: community.id, is_admin: true }]);
+      onCreated(community);
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <Sheet onClose={onClose}>
+      <div style={{ fontFamily: "Bebas Neue", fontSize: 20, color: T.ink, marginBottom: 16 }}>Nova comunidade</div>
+      <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
+        <label style={{ position: "relative", cursor: "pointer", width: 72, height: 72 }}>
+          {preview ? (
+            <img src={preview} alt="" style={{ width: 72, height: 72, borderRadius: 16, objectFit: "cover", display: "block" }} />
+          ) : (
+            <div style={{ width: 72, height: 72, borderRadius: 16, background: T.surface2, display: "flex", alignItems: "center", justifyContent: "center", border: `1.5px dashed ${T.line}` }}>
+              <ImageIcon size={22} color={T.steelDim} />
+            </div>
+          )}
+          <div style={{ position: "absolute", bottom: -2, right: -2, width: 26, height: 26, borderRadius: "50%", background: T.flame, display: "flex", alignItems: "center", justifyContent: "center", border: `2px solid ${T.surface}` }}>
+            <Camera size={12} color="#1B0D06" />
+          </div>
+          <input type="file" accept="image/*" onChange={pickFile} style={{ display: "none" }} />
+        </label>
+      </div>
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontFamily: "Inter", fontSize: 11, color: T.steel, marginBottom: 6, fontWeight: 700 }}>NOME DA COMUNIDADE</div>
+        <input value={nome} onChange={(e) => setNome(e.target.value)} placeholder="Ex: Turma do Crossfit — Centro" style={{ width: "100%", padding: 12, borderRadius: 10, border: `1px solid ${T.line}`, background: T.surface2, color: T.ink, fontFamily: "Inter", fontSize: 13.5 }} />
+      </div>
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontFamily: "Inter", fontSize: 11, color: T.steel, marginBottom: 6, fontWeight: 700 }}>DESCRIÇÃO / REGRAS (OPCIONAL)</div>
+        <textarea value={descricao} onChange={(e) => setDescricao(e.target.value)} placeholder="Do que se trata essa comunidade?" style={{ width: "100%", minHeight: 70, padding: 12, borderRadius: 10, border: `1px solid ${T.line}`, background: T.surface2, color: T.ink, fontFamily: "Inter", fontSize: 13, resize: "none" }} />
+      </div>
+      <ErrorBox msg={err} />
+      <button disabled={loading || !nome.trim()} onClick={submit} style={{
+        width: "100%", padding: 14, borderRadius: 12, border: "none", cursor: (loading || !nome.trim()) ? "default" : "pointer",
+        background: nome.trim() ? `linear-gradient(90deg, ${T.flame}, ${T.flame2})` : T.surface2, color: nome.trim() ? "#1B0D06" : T.steelDim,
+        fontFamily: "Bebas Neue", fontSize: 16, letterSpacing: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+      }}>{loading ? <Spinner size={16} color="#1B0D06" /> : "CRIAR COMUNIDADE"}</button>
+    </Sheet>
+  );
+}
+
+function StoryViewer({ group, onClose }) {
+  const [idx, setIdx] = useState(0);
+  useEffect(() => {
+    const t = setTimeout(() => { if (idx < group.stories.length - 1) setIdx((i) => i + 1); else onClose(); }, 5000);
+    return () => clearTimeout(t);
+  }, [idx]);
+  const story = group.stories[idx];
+  return (
+    <div onClick={(e) => {
+      const x = e.clientX, w = e.currentTarget.clientWidth;
+      if (x < w / 2) { if (idx > 0) setIdx((i) => i - 1); } else { if (idx < group.stories.length - 1) setIdx((i) => i + 1); else onClose(); }
+    }} style={{ position: "fixed", inset: 0, background: "#000", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ position: "absolute", top: 10, left: 10, right: 10, display: "flex", gap: 4 }}>
+        {group.stories.map((s, i) => (
+          <div key={s.id} style={{ flex: 1, height: 3, borderRadius: 2, background: i < idx ? "#fff" : i === idx ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.3)" }} />
+        ))}
+      </div>
+      <button onClick={(e) => { e.stopPropagation(); onClose(); }} style={{ position: "absolute", top: 20, right: 14, background: "none", border: "none", color: "#fff", cursor: "pointer", zIndex: 2 }}><X size={22} /></button>
+      <img src={story.media_url} alt="" style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }} />
+    </div>
+  );
+}
+
+function StoriesBar({ userId, token, myProfile }) {
+  const [stories, setStories] = useState([]);
+  const [profilesById, setProfilesById] = useState({});
+  const [viewedIds, setViewedIds] = useState(new Set());
+  const [viewerGroup, setViewerGroup] = useState(null);
+  const [uploading, setUploading] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const rows = await sbSelect("stories", token, "select=*&order=created_at.asc");
+        setStories(rows);
+        const uids = [...new Set(rows.map((r) => r.user_id))];
+        if (uids.length) {
+          const profs = await sbSelect("public_profiles", token, `id=in.(${uids.join(",")})&select=*`);
+          setProfilesById(Object.fromEntries(profs.map((p) => [p.id, p])));
+        }
+        const seen = await sbSelect("story_views", token, `user_id=eq.${userId}&select=story_id`);
+        setViewedIds(new Set(seen.map((s) => s.story_id)));
+      } catch (e) { /* sem stories */ }
+    })();
+  }, [userId, token]);
+
+  const grouped = useMemo(() => {
+    const byUser = {};
+    stories.forEach((s) => { (byUser[s.user_id] ||= []).push(s); });
+    return Object.entries(byUser).map(([uid, list]) => ({ userId: uid, stories: list, hasUnseen: list.some((s) => !viewedIds.has(s.id)) }));
+  }, [stories, viewedIds]);
+
+  async function pickFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setUploading(true);
+    try {
+      const path = `${userId}/${Date.now()}-${f.name.replace(/[^a-zA-Z0-9._-]/g, "")}`;
+      const url = await sbUploadFile("stories", token, path, f);
+      const created = await sbInsert("stories", token, [{ user_id: userId, media_url: url }]);
+      setStories((s) => [...s, created[0]]);
+      setProfilesById((p) => ({ ...p, [userId]: myProfile }));
+    } catch (e) { /* falha silenciosa */ }
+    finally { setUploading(false); }
+  }
+
+  function openGroup(g) {
+    setViewerGroup(g);
+    g.stories.forEach((s) => { if (!viewedIds.has(s.id)) sbInsert("story_views", token, [{ user_id: userId, story_id: s.id }]).catch(() => {}); });
+    setViewedIds((prev) => new Set([...prev, ...g.stories.map((s) => s.id)]));
+  }
+
+  return (
+    <div style={{ display: "flex", gap: 14, overflowX: "auto", paddingBottom: 6, marginBottom: 14 }}>
+      <label style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, flexShrink: 0, cursor: "pointer" }}>
+        <div style={{ width: 56, height: 56, borderRadius: "50%", border: `1.5px dashed ${T.line}`, display: "flex", alignItems: "center", justifyContent: "center", background: T.surface2 }}>
+          {uploading ? <Spinner size={16} /> : <Plus size={20} color={T.steel} />}
+        </div>
+        <span style={{ fontFamily: "Inter", fontSize: 9.5, color: T.steel }}>Seu story</span>
+        <input type="file" accept="image/*" capture="environment" onChange={pickFile} style={{ display: "none" }} />
+      </label>
+      {grouped.map((g) => {
+        const p = profilesById[g.userId] || {};
+        return (
+          <button key={g.userId} onClick={() => openGroup(g)} style={{ background: "none", border: "none", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, flexShrink: 0, cursor: "pointer" }}>
+            <div style={{ width: 56, height: 56, borderRadius: "50%", padding: 2, background: g.hasUnseen ? `linear-gradient(135deg, ${T.flame}, ${T.flame2})` : T.line }}>
+              <div style={{ width: "100%", height: "100%", borderRadius: "50%", padding: 2, background: T.bg }}>
+                {p.avatar_url ? <img src={p.avatar_url} alt="" style={{ width: "100%", height: "100%", borderRadius: "50%", objectFit: "cover" }} /> : <div style={{ width: "100%", height: "100%", borderRadius: "50%", background: T.surface2, display: "flex", alignItems: "center", justifyContent: "center" }}><User size={18} color={T.steelDim} /></div>}
+              </div>
+            </div>
+            <span style={{ fontFamily: "Inter", fontSize: 9.5, color: T.steel, maxWidth: 56, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.nome || "Atleta"}</span>
+          </button>
+        );
+      })}
+      {viewerGroup && <StoryViewer group={viewerGroup} onClose={() => setViewerGroup(null)} />}
+    </div>
+  );
+}
+
+function ProfileViewScreen({ user, token, onBack, onMessage }) {
+  const [full, setFull] = useState(user);
+  const [streak, setStreak] = useState(null);
+  const [grid, setGrid] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [profs, streaks, photos, posts] = await Promise.all([
+          sbSelect("public_profiles", token, `id=eq.${user.id}&select=*`),
+          sbSelect("streaks", token, `user_id=eq.${user.id}&select=streak_atual`),
+          sbSelect("progress_photos", token, `user_id=eq.${user.id}&is_private=eq.false&select=*&order=created_at.desc&limit=30`),
+          sbSelect("posts", token, `user_id=eq.${user.id}&community_id=is.null&image_url=not.is.null&select=*&order=created_at.desc&limit=30`),
+        ]);
+        if (profs[0]) setFull(profs[0]);
+        setStreak(streaks[0]?.streak_atual ?? null);
+        const combo = [
+          ...photos.map((p) => ({ id: `ph-${p.id}`, image_url: p.image_url, created_at: p.created_at })),
+          ...posts.map((p) => ({ id: `po-${p.id}`, image_url: p.image_url, created_at: p.created_at })),
+        ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        setGrid(combo);
+      } catch (e) { /* perfil parcial */ }
+      finally { setLoading(false); }
+    })();
+  }, [user.id, token]);
+
+  return (
+    <div>
+      <button onClick={onBack} style={{ width: 34, height: 34, borderRadius: "50%", border: `1px solid ${T.line}`, background: T.surface, color: T.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", marginBottom: 16 }}><ArrowLeft size={16} /></button>
+
+      <div style={{ textAlign: "center", marginBottom: 20 }}>
+        {full.avatar_url ? <img src={full.avatar_url} alt="" style={{ width: 84, height: 84, borderRadius: "50%", objectFit: "cover", margin: "0 auto 12px", display: "block" }} /> : <div style={{ width: 84, height: 84, borderRadius: "50%", background: T.surface2, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px" }}><User size={34} color={T.steelDim} /></div>}
+        <div style={{ fontFamily: "Bebas Neue", fontSize: 22, color: T.ink }}>{full.nome || "Atleta"}</div>
+        {streak != null && (
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 5, marginTop: 8, padding: "5px 12px", borderRadius: 999, background: hexToRgba(T.flame, 0.10) }}>
+            <Flame size={13} color={T.flame} /><span style={{ fontFamily: "IBM Plex Mono", fontSize: 12, color: T.flame2 }}>{streak} dias de ofensiva</span>
+          </div>
+        )}
+        <div>
+          <button onClick={onMessage} style={{ marginTop: 14, padding: "9px 18px", borderRadius: 999, border: "none", background: `linear-gradient(90deg, ${T.flame}, ${T.flame2})`, color: "#1B0D06", fontFamily: "Inter", fontWeight: 700, fontSize: 12.5, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <MessageCircle size={14} /> Enviar mensagem
+          </button>
+        </div>
+      </div>
+
+      <SectionTitle>Evolução</SectionTitle>
+      {loading ? <div style={{ display: "flex", justifyContent: "center", padding: 20 }}><Spinner size={20} /></div>
+        : grid.length === 0 ? <EmptyState text="Sem fotos públicas ainda." />
+        : (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4 }}>
+            {grid.map((g) => (
+              <div key={g.id} style={{ aspectRatio: "1", borderRadius: 4, overflow: "hidden", background: T.surface2 }}>
+                <img src={g.image_url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+              </div>
+            ))}
+          </div>
+        )}
+    </div>
+  );
+}
+
+function ComunidadeScreen({ userId, token, myProfile, onlineIds, hasUnreadDM }) {
+  const [view, setView] = useState("explore"); // explore | discover | community | chats | chat | profile
+  const [activeCommunity, setActiveCommunity] = useState(null);
+  const [activeChat, setActiveChat] = useState(null);
+  const [viewingUser, setViewingUser] = useState(null);
+  const [returnView, setReturnView] = useState("explore");
+
+  async function openChatWith(otherUser) {
+    const [a, b] = userId < otherUser.id ? [userId, otherUser.id] : [otherUser.id, userId];
+    try {
+      let existing = await sbSelect("chats", token, `user_a=eq.${a}&user_b=eq.${b}&select=*`);
+      let chat = existing[0];
+      if (!chat) {
+        const created = await sbUpsert("chats", token, [{ user_a: a, user_b: b }], "user_a,user_b");
+        chat = created[0];
+      }
+      setActiveChat({ id: chat.id, otherId: otherUser.id, otherName: otherUser.nome || "Atleta" });
+      setView("chat");
+    } catch (e) { /* falha silenciosa, tenta de novo depois */ }
+  }
+  function openProfile(user) {
+    if (user.id === userId) return; // já está no seu próprio Perfil (outra aba)
+    setViewingUser(user);
+    setReturnView(view);
+    setView("profile");
+  }
+
+  if (view === "profile" && viewingUser) return <ProfileViewScreen user={viewingUser} token={token} onBack={() => setView(returnView)} onMessage={() => openChatWith(viewingUser)} />;
+  if (view === "chats") return <ChatListScreen userId={userId} token={token} onlineIds={onlineIds} onBack={() => setView(activeCommunity ? "community" : "explore")} onOpenChat={(c) => { setActiveChat(c); setView("chat"); }} />;
+  if (view === "chat" && activeChat) return <ChatScreen chat={activeChat} userId={userId} token={token} myNome={myProfile.nome} onBack={() => setView("chats")} />;
+  if (view === "community" && activeCommunity) return <FeedScreen userId={userId} token={token} myProfile={myProfile} community={activeCommunity} onBack={() => setView("discover")} onOpenMessages={() => setView("chats")} onOpenProfile={openProfile} hasUnreadDM={hasUnreadDM} />;
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        <Pill active={view === "explore"} onClick={() => setView("explore")}>Explorar</Pill>
+        <Pill active={view === "discover"} onClick={() => setView("discover")}>Grupos</Pill>
+      </div>
+      {view === "explore"
+        ? <ExploreScreen userId={userId} token={token} myProfile={myProfile} onOpenMessages={() => setView("chats")} onOpenProfile={openProfile} hasUnreadDM={hasUnreadDM} />
+        : <CommunityDiscoveryScreen userId={userId} token={token} onOpenMessages={() => setView("chats")} onEnterCommunity={(c) => { setActiveCommunity(c); setView("community"); }} hasUnreadDM={hasUnreadDM} />}
+    </div>
+  );
+}
+
+/* ============================================================
    PERFIL / GAMIFICAÇÃO
    ============================================================ */
-function PerfilTab({ profile, email, streak, trainedToday, freezes, onUseFreeze, totalKg, workoutCount, onLogout, onSaveProfile }) {
+function PerfilTab({ profile, email, token, streak, trainedToday, freezes, onUseFreeze, totalKg, workoutCount, onLogout, onSaveProfile, exerciseLogs, bodyLogs, workoutLogs, weekMeals, metaKcal, onAddBodyLog, progressPhotos, bodyLogCount, messagesSentCount, communitiesJoinedCount }) {
   const [editing, setEditing] = useState(false);
+  const [sub, setSub] = useState("dados"); // dados | progresso | conquistas
+
   const badges = [
-    { id: "b1", nome: "Primeira gota", desc: "Concluiu o 1º treino", icon: Dumbbell, unlocked: workoutCount >= 1 },
-    { id: "b2", nome: "1 tonelada", desc: "Levantou 1.000 kg no total", icon: Trophy, unlocked: totalKg >= 1000 },
-    { id: "b3", nome: "7 dias seguidos", desc: "Ofensiva de 1 semana", icon: Flame, unlocked: streak >= 7 },
-    { id: "b4", nome: "Consistência", desc: "10 treinos registrados", icon: Clock, unlocked: workoutCount >= 10 },
-    { id: "b5", nome: "30 dias de fogo", desc: "Ofensiva de 1 mês", icon: Zap, unlocked: streak >= 30 },
-    { id: "b6", nome: "3 toneladas", desc: "Levantou 3.000 kg no total", icon: Trophy, unlocked: totalKg >= 3000 },
+    { id: "b1", nome: "O Despertar da Forja", desc: "Finalizou o 1º treino com a IA", icon: Dumbbell, unlocked: workoutCount >= 1 },
+    { id: "b2", nome: "7 dias de chama", desc: "Streak de 7 dias seguidos", icon: Flame, unlocked: streak >= 7 },
+    { id: "b3", nome: "21 dias de chama", desc: "Streak de 21 dias seguidos", icon: Flame, unlocked: streak >= 21 },
+    { id: "b4", nome: "90 dias de chama", desc: "Streak de 90 dias seguidos", icon: Flame, unlocked: streak >= 90 },
+    { id: "b5", nome: "1 tonelada", desc: "1.000 kg de volume total", icon: Trophy, unlocked: totalKg >= 1000 },
+    { id: "b6", nome: "5 toneladas", desc: "5.000 kg de volume total", icon: Trophy, unlocked: totalKg >= 5000 },
+    { id: "b7", nome: "10 toneladas", desc: "10.000 kg de volume total", icon: Trophy, unlocked: totalKg >= 10000 },
+    { id: "b8", nome: "O Observador", desc: "5 fotos na timeline de progresso", icon: Camera, unlocked: (progressPhotos?.length || 0) >= 5 },
+    { id: "b9", nome: "Corpo em Mutação", desc: "3 registros de peso corporal", icon: TrendingUp, unlocked: (bodyLogCount || 0) >= 3 },
+    { id: "b10", nome: "Socializador", desc: "1ª mensagem ou 1ª comunidade", icon: Users, unlocked: (messagesSentCount || 0) >= 1 || (communitiesJoinedCount || 0) >= 1 },
   ];
+
   return (
     <div>
       <Card style={{ textAlign: "center", padding: "18px 16px" }}>
@@ -1490,59 +3025,116 @@ function PerfilTab({ profile, email, streak, trainedToday, freezes, onUseFreeze,
         }}><Settings size={13} /> Editar perfil</button>
       </Card>
 
-      <Card style={{ background: trainedToday ? `linear-gradient(135deg, ${hexToRgba(T.flame, 0.16)}, ${hexToRgba(T.flame2, 0.05)})` : T.surface, border: `1px solid ${trainedToday ? T.flame : T.line}`, textAlign: "center", padding: "26px 16px", marginTop: 16 }}>
-        <FlameBadge size={54} active={trainedToday} />
-        <div style={{ fontFamily: "Bebas Neue", fontSize: 46, color: T.ink, marginTop: 8, lineHeight: 1 }}>{streak}</div>
-        <div style={{ fontFamily: "Inter", fontSize: 12.5, color: trainedToday ? T.flame2 : T.steelDim, letterSpacing: 1, fontWeight: 700 }}>{trainedToday ? "DIAS DE OFENSIVA" : "TREINE HOJE PRA CONTINUAR"}</div>
-      </Card>
-
-      <SectionTitle right={<span style={{ fontFamily: "IBM Plex Mono", fontSize: 12, color: T.steel }}>{freezes} disponíveis</span>}>Congelamento de streak</SectionTitle>
-      <Card style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{ width: 42, height: 42, borderRadius: 12, background: hexToRgba(T.blue, 0.15), display: "flex", alignItems: "center", justifyContent: "center" }}><Snowflake size={20} color={T.blue} /></div>
-          <div>
-            <div style={{ fontFamily: "Inter", fontWeight: 700, fontSize: 13.5, color: T.ink }}>Passe de congelamento</div>
-            <div style={{ fontFamily: "Inter", fontSize: 11.5, color: T.steel }}>Protege sua ofensiva se faltar 1 dia</div>
-          </div>
-        </div>
-        <button disabled={freezes === 0} onClick={onUseFreeze} style={{ padding: "9px 14px", borderRadius: 10, border: "none", cursor: freezes ? "pointer" : "not-allowed", background: freezes ? T.blue : T.surface2, color: freezes ? "#0E1013" : T.steelDim, fontFamily: "Inter", fontWeight: 700, fontSize: 12.5 }}>Usar</button>
-      </Card>
-
-      <SectionTitle>Conquistas</SectionTitle>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-        {badges.map((b) => (
-          <Card key={b.id} style={{ opacity: b.unlocked ? 1 : 0.5, padding: 14 }}>
-            <div style={{ width: 38, height: 38, borderRadius: 10, marginBottom: 10, display: "flex", alignItems: "center", justifyContent: "center", background: b.unlocked ? hexToRgba(T.volt, 0.12) : T.surface2 }}>
-              {b.unlocked ? <b.icon size={18} color={T.volt} /> : <Lock size={16} color={T.steelDim} />}
-            </div>
-            <div style={{ fontFamily: "Inter", fontWeight: 700, fontSize: 12.5, color: T.ink }}>{b.nome}</div>
-            <div style={{ fontFamily: "Inter", fontSize: 10.5, color: T.steel, marginTop: 2 }}>{b.desc}</div>
-          </Card>
+      <div style={{ display: "flex", background: T.surface2, borderRadius: 12, padding: 4, marginTop: 16, marginBottom: 16, border: `1px solid ${T.line}` }}>
+        {[["dados", "Meus Dados"], ["progresso", "Meu Progresso"], ["conquistas", "Conquistas"]].map(([id, label]) => (
+          <button key={id} onClick={() => setSub(id)} style={{
+            flex: 1, padding: "9px 4px", borderRadius: 9, border: "none", cursor: "pointer",
+            background: sub === id ? T.flame : "transparent", color: sub === id ? "#1B0D06" : T.steel,
+            fontFamily: "Inter", fontWeight: 700, fontSize: 11.5,
+          }}>{label}</button>
         ))}
       </div>
 
-      <SectionTitle>Total levantado</SectionTitle>
-      <Card style={{ textAlign: "center", padding: 22 }}>
-        <div style={{ fontFamily: "Bebas Neue", fontSize: 38, color: T.ink }}>{(totalKg / 1000).toFixed(2)}<span style={{ fontSize: 18, color: T.steel }}> toneladas</span></div>
-        <div style={{ fontFamily: "Inter", fontSize: 11.5, color: T.steel, marginTop: 4 }}>peso × séries × repetições, somado</div>
-      </Card>
+      {sub === "dados" && (
+        <div>
+          <Card style={{ background: trainedToday ? `linear-gradient(135deg, ${hexToRgba(T.flame, 0.16)}, ${hexToRgba(T.flame2, 0.05)})` : T.surface, border: `1px solid ${trainedToday ? T.flame : T.line}`, textAlign: "center", padding: "26px 16px" }}>
+            <FlameBadge size={54} active={trainedToday} />
+            <div style={{ fontFamily: "Bebas Neue", fontSize: 46, color: T.ink, marginTop: 8, lineHeight: 1 }}>{streak}</div>
+            <div style={{ fontFamily: "Inter", fontSize: 12.5, color: trainedToday ? T.flame2 : T.steelDim, letterSpacing: 1, fontWeight: 700 }}>{trainedToday ? "DIAS DE OFENSIVA" : "TREINE HOJE PRA CONTINUAR"}</div>
+          </Card>
 
-      <button onClick={onLogout} style={{ width: "100%", marginTop: 22, padding: 14, borderRadius: 12, border: `1px solid ${T.line}`, background: T.surface, color: T.steel, fontFamily: "Inter", fontWeight: 700, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-        <LogOut size={15} /> Sair da conta
-      </button>
+          <SectionTitle right={<span style={{ fontFamily: "IBM Plex Mono", fontSize: 12, color: T.steel }}>{freezes} disponíveis</span>}>Congelamento de streak</SectionTitle>
+          <Card style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ width: 42, height: 42, borderRadius: 12, background: hexToRgba(T.blue, 0.15), display: "flex", alignItems: "center", justifyContent: "center" }}><Snowflake size={20} color={T.blue} /></div>
+              <div>
+                <div style={{ fontFamily: "Inter", fontWeight: 700, fontSize: 13.5, color: T.ink }}>Passe de congelamento</div>
+                <div style={{ fontFamily: "Inter", fontSize: 11.5, color: T.steel }}>Protege sua ofensiva se faltar 1 dia</div>
+              </div>
+            </div>
+            <button disabled={freezes === 0} onClick={onUseFreeze} style={{ padding: "9px 14px", borderRadius: 10, border: "none", cursor: freezes ? "pointer" : "not-allowed", background: freezes ? T.blue : T.surface2, color: freezes ? "#0E1013" : T.steelDim, fontFamily: "Inter", fontWeight: 700, fontSize: 12.5 }}>Usar</button>
+          </Card>
 
-      {editing && <EditProfileModal profile={profile} onClose={() => setEditing(false)} onSave={onSaveProfile} />}
+          <SectionTitle>Total levantado</SectionTitle>
+          <Card style={{ textAlign: "center", padding: 22 }}>
+            <div style={{ fontFamily: "Bebas Neue", fontSize: 38, color: T.ink }}>{(totalKg / 1000).toFixed(2)}<span style={{ fontSize: 18, color: T.steel }}> toneladas</span></div>
+            <div style={{ fontFamily: "Inter", fontSize: 11.5, color: T.steel, marginTop: 4 }}>peso × séries × repetições, somado</div>
+          </Card>
+
+          <button onClick={onLogout} style={{ width: "100%", marginTop: 22, padding: 14, borderRadius: 12, border: `1px solid ${T.line}`, background: T.surface, color: T.steel, fontFamily: "Inter", fontWeight: 700, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            <LogOut size={15} /> Sair da conta
+          </button>
+        </div>
+      )}
+
+      {sub === "progresso" && (
+        <div>
+          <ProgressoTab exerciseLogs={exerciseLogs} bodyLogs={bodyLogs} workoutLogs={workoutLogs} weekMeals={weekMeals} metaKcal={metaKcal} onAddBodyLog={onAddBodyLog} />
+          <SectionTitle>Timeline visual</SectionTitle>
+          {(!progressPhotos || progressPhotos.length === 0) ? (
+            <EmptyState text="Nenhuma foto de progresso ainda. Elas aparecem aqui sempre que você registra uma foto pós-treino." />
+          ) : (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+              {progressPhotos.map((p) => (
+                <div key={p.id} style={{ position: "relative", aspectRatio: "1", borderRadius: 10, overflow: "hidden", background: T.surface2 }}>
+                  <img src={p.image_url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                  <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "4px 6px", background: "linear-gradient(to top, rgba(0,0,0,0.7), transparent)" }}>
+                    <span style={{ fontFamily: "Inter", fontSize: 8.5, color: "#fff" }}>{new Date(p.created_at).toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" })}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {sub === "conquistas" && (
+        <div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            {badges.map((b) => (
+              <Card key={b.id} style={{ opacity: b.unlocked ? 1 : 0.4, filter: b.unlocked ? "none" : "grayscale(1)", padding: 14, border: b.unlocked ? `1px solid ${T.flame2}` : `1px solid ${T.line}`, transition: "opacity .2s, filter .2s" }}>
+                <div style={{
+                  width: 38, height: 38, borderRadius: 10, marginBottom: 10, display: "flex", alignItems: "center", justifyContent: "center",
+                  background: b.unlocked ? `linear-gradient(135deg, ${hexToRgba(T.flame2, 0.25)}, ${hexToRgba(T.flame, 0.15)})` : T.surface2,
+                }}>
+                  {b.unlocked ? <b.icon size={18} color={T.flame2} /> : <Lock size={16} color={T.steelDim} />}
+                </div>
+                <div style={{ fontFamily: "Inter", fontWeight: 700, fontSize: 12.5, color: T.ink }}>{b.nome}</div>
+                <div style={{ fontFamily: "Inter", fontSize: 10.5, color: T.steel, marginTop: 2 }}>{b.desc}</div>
+              </Card>
+            ))}
+          </div>
+          <div style={{ textAlign: "center", marginTop: 16, fontFamily: "Inter", fontSize: 11.5, color: T.steel }}>
+            {badges.filter((b) => b.unlocked).length} de {badges.length} desbloqueadas
+          </div>
+        </div>
+      )}
+
+      {editing && <EditProfileModal profile={profile} token={token} onClose={() => setEditing(false)} onSave={onSaveProfile} />}
     </div>
   );
 }
-function EditProfileModal({ profile, onClose, onSave }) {
+function EditProfileModal({ profile, token, onClose, onSave }) {
   const [form, setForm] = useState({
     nome: profile.nome || "", email: profile.email || "", avatar_url: profile.avatar_url || "",
     objetivo_principal: profile.objetivo_principal, nivel_experiencia: profile.nivel_experiencia,
     dias_semana: profile.dias_semana, foco_muscular: profile.foco_muscular,
   });
   const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [err, setErr] = useState("");
+
+  async function pickAvatar(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true); setErr("");
+    try {
+      const path = `${profile.id}/avatar-${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, "")}`;
+      const url = await sbUploadFile("avatars", token, path, file);
+      setForm((f) => ({ ...f, avatar_url: url }));
+    } catch (e2) { setErr(e2.message); }
+    finally { setUploading(false); }
+  }
 
   function pillField(key, label, options) {
     return (
@@ -1572,17 +3164,31 @@ function EditProfileModal({ profile, onClose, onSave }) {
     <Sheet onClose={onClose}>
       <div style={{ fontFamily: "Bebas Neue", fontSize: 20, color: T.ink, marginBottom: 16 }}>Editar perfil</div>
       <div style={{ maxHeight: "55vh", overflowY: "auto", paddingRight: 2 }}>
+        <div style={{ display: "flex", justifyContent: "center", marginBottom: 18 }}>
+          <label style={{ position: "relative", cursor: "pointer", width: 84, height: 84 }}>
+            {form.avatar_url ? (
+              <img src={form.avatar_url} alt="" style={{ width: 84, height: 84, borderRadius: "50%", objectFit: "cover", border: `2px solid ${T.line}`, display: "block" }} />
+            ) : (
+              <div style={{ width: 84, height: 84, borderRadius: "50%", background: T.surface2, display: "flex", alignItems: "center", justifyContent: "center", border: `2px solid ${T.line}` }}>
+                <User size={32} color={T.steelDim} />
+              </div>
+            )}
+            <div style={{
+              position: "absolute", bottom: -2, right: -2, width: 30, height: 30, borderRadius: "50%",
+              background: T.flame, display: "flex", alignItems: "center", justifyContent: "center", border: `2px solid ${T.surface}`,
+            }}>
+              {uploading ? <Spinner size={13} color="#1B0D06" /> : <Camera size={14} color="#1B0D06" />}
+            </div>
+            <input type="file" accept="image/*" onChange={pickAvatar} style={{ display: "none" }} />
+          </label>
+        </div>
         <div style={{ marginBottom: 12 }}>
           <div style={{ fontFamily: "Inter", fontSize: 11, color: T.steel, marginBottom: 6, fontWeight: 700 }}>NOME</div>
           <InputField icon={User} placeholder="Seu nome" value={form.nome} onChange={(v) => setForm((f) => ({ ...f, nome: v }))} />
         </div>
-        <div style={{ marginBottom: 12 }}>
+        <div style={{ marginBottom: 16 }}>
           <div style={{ fontFamily: "Inter", fontSize: 11, color: T.steel, marginBottom: 6, fontWeight: 700 }}>E-MAIL</div>
           <InputField icon={Mail} type="email" placeholder="seu@email.com" value={form.email} onChange={(v) => setForm((f) => ({ ...f, email: v }))} />
-        </div>
-        <div style={{ marginBottom: 16 }}>
-          <div style={{ fontFamily: "Inter", fontSize: 11, color: T.steel, marginBottom: 6, fontWeight: 700 }}>FOTO DE PERFIL (LINK DE IMAGEM)</div>
-          <InputField icon={Link2} placeholder="https://..." value={form.avatar_url} onChange={(v) => setForm((f) => ({ ...f, avatar_url: v }))} />
         </div>
         <div style={{ height: 1, background: T.line, margin: "6px 0 16px" }} />
         <div style={{ fontFamily: "Inter", fontSize: 12, color: T.ink, fontWeight: 700, marginBottom: 10 }}>Metas de treino</div>
@@ -1620,12 +3226,20 @@ function InicioTab({ profile, streak, trainedToday, plan, dayIndex, goTreino, vo
       </Card>
 
       <SectionTitle>Próximo treino</SectionTitle>
-      <Card className="card-fx" style={{ background: `linear-gradient(135deg, ${T.surface2}, ${T.surface})`, cursor: "pointer" }} onClick={goTreino}>
-        <div style={{ fontFamily: "Inter", fontSize: 11.5, color: T.volt, fontWeight: 700, letterSpacing: 0.5 }}>PLANO GERADO PELA IA</div>
-        <div style={{ fontFamily: "Bebas Neue", fontSize: 22, color: T.ink, margin: "6px 0" }}>{nextDay.nome}</div>
-        <div style={{ fontFamily: "Inter", fontSize: 12.5, color: T.steel, marginBottom: 12 }}>{nextDay.exercicios.length} exercícios · {EQUIP_LABEL[profile.equipamento]}</div>
-        <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "10px 16px", borderRadius: 10, background: T.flame, color: "#1B0D06", fontFamily: "Inter", fontWeight: 700, fontSize: 13 }}>Começar treino <ArrowRight size={15} /></div>
-      </Card>
+      {nextDay ? (
+        <Card className="card-fx" style={{ background: `linear-gradient(135deg, ${T.surface2}, ${T.surface})`, cursor: "pointer" }} onClick={goTreino}>
+          <div style={{ fontFamily: "Inter", fontSize: 11.5, color: T.volt, fontWeight: 700, letterSpacing: 0.5 }}>PLANO GERADO PELA IA</div>
+          <div style={{ fontFamily: "Bebas Neue", fontSize: 22, color: T.ink, margin: "6px 0" }}>{nextDay.nome}</div>
+          <div style={{ fontFamily: "Inter", fontSize: 12.5, color: T.steel, marginBottom: 12 }}>{nextDay.exercicios.length} exercícios · {EQUIP_LABEL[profile.equipamento]}</div>
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "10px 16px", borderRadius: 10, background: T.flame, color: "#1B0D06", fontFamily: "Inter", fontWeight: 700, fontSize: 13 }}>Começar treino <ArrowRight size={15} /></div>
+        </Card>
+      ) : (
+        <Card className="card-fx" style={{ background: `linear-gradient(135deg, ${T.surface2}, ${T.surface})`, cursor: "pointer", textAlign: "center" }} onClick={goTreino}>
+          <Sparkles size={22} color={T.flame} style={{ marginBottom: 8 }} />
+          <div style={{ fontFamily: "Bebas Neue", fontSize: 18, color: T.ink, marginBottom: 4 }}>Você ainda não tem um treino</div>
+          <div style={{ fontFamily: "Inter", fontSize: 12.5, color: T.steel }}>Toque aqui pra deixar a IA forjar o seu primeiro plano</div>
+        </Card>
+      )}
 
       <SectionTitle>Resumo da semana</SectionTitle>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -1669,6 +3283,9 @@ function AppShell() {
   const [meals, setMeals] = useState([]);
   const [weekMeals, setWeekMeals] = useState([]);
   const [aiDietSuggestions, setAiDietSuggestions] = useState([]);
+  const [myCommunities, setMyCommunities] = useState([]);
+  const [progressPhotos, setProgressPhotos] = useState([]);
+  const [messagesSentCount, setMessagesSentCount] = useState(0);
   const [waterMl, setWaterMl] = useState(0);
 
   const [tab, setTab] = useState("inicio");
@@ -1676,6 +3293,8 @@ function AppShell() {
   const [phase, setPhase] = useState("loading");
   const [onbSaving, setOnbSaving] = useState(false);
   const [showWelcome, setShowWelcome] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [onlineIds, setOnlineIds] = useState(new Set());
   const [onbError, setOnbError] = useState("");
   const [globalError, setGlobalError] = useState("");
   const [authBanner, setAuthBanner] = useState("");
@@ -1702,6 +3321,7 @@ function AppShell() {
       if (!profs.length) { setPhase("onboarding"); return; }
       const prof = profs[0];
       setProfile({ ...prof, lesao_regiao: prof.lesao_regiao || "nenhuma" });
+      sbUpsert("public_profiles", token, [{ id: uid, nome: prof.nome, avatar_url: prof.avatar_url || null }], "id").catch(() => {});
       setAiDietSuggestions(prof.ai_diet_suggestions || []);
       setNome(prof.nome);
 
@@ -1719,15 +3339,10 @@ function AppShell() {
       const val = (r) => r.status === "fulfilled" ? r.value : [];
       const [plans, streaks, exLogs, bLogs, wLogs, mealsToday, waterToday, mealsWeekRes] = results.map(val);
 
-      let planRow = plans[0];
-      if (!planRow) {
-        try {
-          const newPlan = generatePlan(prof);
-          const created = await sbUpsert("workout_plans", token, [{ user_id: uid, plano: newPlan }], "user_id");
-          planRow = created[0];
-        } catch (e) { /* segue com plano gerado localmente */ }
-      }
-      setPlan(planRow ? planRow.plano : generatePlan(prof));
+      // sem geração automática de plano — o usuário cria com a IA
+      // quando quiser, a partir do Empty State da aba Treino
+      const planRow = plans[0];
+      setPlan(planRow ? planRow.plano : []);
 
       let streakRow = streaks[0];
       if (!streakRow) {
@@ -1746,6 +3361,18 @@ function AppShell() {
       setMeals(mealsToday);
       setWeekMeals(mealsWeekRes);
       setWaterMl(waterToday.reduce((s, r) => s + r.ml, 0));
+
+      // dados da Comunidade usados no Perfil (conquistas) e no fluxo pós-treino
+      try {
+        const [memberships, photos, sentMsgs] = await Promise.all([
+          sbSelect("community_members", token, `user_id=eq.${uid}&select=*,communities(*)`),
+          sbSelect("progress_photos", token, `user_id=eq.${uid}&select=*&order=created_at.desc&limit=100`),
+          sbSelect("messages", token, `sender_id=eq.${uid}&select=id&limit=1`),
+        ]);
+        setMyCommunities(memberships.map((m) => m.communities).filter(Boolean));
+        setProgressPhotos(photos);
+        setMessagesSentCount(sentMsgs.length);
+      } catch (e) { /* opcional, não bloqueia o resto do app */ }
 
       setAuthBanner("");
       setPhase("ready");
@@ -1767,6 +3394,38 @@ function AppShell() {
     }
   }, [authPhase, session, loadAll]);
 
+  // Notificação global de mensagens não lidas — ouve a tabela `messages`
+  // filtrando por receiver_id (funciona em qualquer tela, não só no chat)
+  useEffect(() => {
+    if (!session) { setUnreadCount(0); return; }
+    async function refreshUnread() {
+      try {
+        const rows = await sbSelect("messages", session.token, `receiver_id=eq.${session.user.id}&lida=eq.false&select=id`);
+        setUnreadCount(rows.length);
+      } catch (e) { /* mantém contagem anterior */ }
+    }
+    refreshUnread();
+    const channel = supabaseRealtime
+      .channel(`unread-${session.user.id}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "messages", filter: `receiver_id=eq.${session.user.id}` }, refreshUnread)
+      .subscribe();
+    return () => supabaseRealtime.removeChannel(channel);
+  }, [session]);
+
+  // Presença global — quem está online agora (Supabase Presence), ativo
+  // enquanto o app estiver aberto, não só na tela de mensagens
+  useEffect(() => {
+    if (!session) { setOnlineIds(new Set()); return; }
+    const channel = supabaseRealtime.channel("presence-online", { config: { presence: { key: session.user.id } } });
+    channel.on("presence", { event: "sync" }, () => {
+      setOnlineIds(new Set(Object.keys(channel.presenceState())));
+    });
+    channel.subscribe(async (status) => {
+      if (status === "SUBSCRIBED") await channel.track({ online_at: new Date().toISOString() });
+    });
+    return () => supabaseRealtime.removeChannel(channel);
+  }, [session]);
+
   async function handleOnboardingDone(data) {
     setOnbSaving(true); setOnbError("");
     try {
@@ -1782,8 +3441,7 @@ function AppShell() {
         preferencia_cardapio: data.preferencia_cardapio,
       };
       await sbInsert("profiles", session.token, [row]);
-      const newPlan = generatePlan(row);
-      await sbUpsert("workout_plans", session.token, [{ user_id: session.user.id, plano: newPlan }], "user_id");
+      await sbUpsert("public_profiles", session.token, [{ id: session.user.id, nome: row.nome, avatar_url: null }], "id");
       await sbUpsert("streaks", session.token, [{ user_id: session.user.id, streak_atual: 0, freezes: 2 }], "user_id");
       await loadAll(session.token, session.user.id);
       setShowWelcome(true);
@@ -1830,6 +3488,34 @@ function AppShell() {
       ]);
       setWorkoutLogs(wLogs); setExerciseLogs(exLogs);
     } catch (e) { setGlobalError(e.message); }
+  }
+
+  async function handleShareWorkout(day, cargaRows, file, communityId) {
+    const totalKgSessao = cargaRows.reduce((s, c) => s + (c.carga || 0) * (c.series || 0) * (parseInt(c.reps) || 10), 0);
+    const foco = day.nome.includes("—") ? day.nome.split("—")[1].trim() : day.nome;
+    const content = `🔥 ${profile.nome || "Atleta"} finalizou o treino de ${foco}${totalKgSessao > 0 ? ` — ${Math.round(totalKgSessao)}kg levantados!` : "!"}`;
+    try {
+      let imageUrl = null;
+      if (file) {
+        const path = `${session.user.id}/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, "")}`;
+        imageUrl = await sbUploadFile("post-images", session.token, path, file);
+      }
+      await sbInsert("posts", session.token, [{ user_id: session.user.id, community_id: communityId, content, image_url: imageUrl, type: "treino", meta: { dia_nome: day.nome, kg: totalKgSessao } }]);
+      if (imageUrl) {
+        const created = await sbInsert("progress_photos", session.token, [{ user_id: session.user.id, image_url: imageUrl, is_private: false, workout_summary: content }]);
+        setProgressPhotos((p) => [created[0], ...p]);
+      }
+    } catch (e) { setGlobalError(e.message); throw e; }
+  }
+
+  async function handleSaveWorkoutPhoto(day, cargaRows, file) {
+    if (!file) return;
+    try {
+      const path = `${session.user.id}/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, "")}`;
+      const imageUrl = await sbUploadFile("progress-photos", session.token, path, file);
+      const created = await sbInsert("progress_photos", session.token, [{ user_id: session.user.id, image_url: imageUrl, is_private: true, workout_summary: day.nome }]);
+      setProgressPhotos((p) => [created[0], ...p]);
+    } catch (e) { setGlobalError(e.message); throw e; }
   }
 
   async function handleAddBodyLog(pesoVal, gorduraVal) {
@@ -1926,8 +3612,9 @@ function AppShell() {
     } catch (e) { setGlobalError(e.message); }
   }
 
-  async function handleGenerateDietWithAI() {
-    const result = await generatePlanWithAI(profile, session.token);
+  async function handleGenerateDietWithAI(alimentoDesejado) {
+    const params = alimentoDesejado ? { ...profile, alimento_desejado: alimentoDesejado } : profile;
+    const result = await generatePlanWithAI(params, session.token);
     setAiDietSuggestions(result.dieta);
     try { await sbUpdate("profiles", session.token, `id=eq.${session.user.id}`, { ai_diet_suggestions: result.dieta }); }
     catch (e) { setGlobalError(e.message); }
@@ -1940,6 +3627,7 @@ function AppShell() {
       dias_semana: form.dias_semana, foco_muscular: form.foco_muscular,
     };
     await sbUpdate("profiles", session.token, `id=eq.${session.user.id}`, patch);
+    await sbUpsert("public_profiles", session.token, [{ id: session.user.id, nome: patch.nome, avatar_url: patch.avatar_url }], "id");
     if (form.email && form.email !== session.user.email) {
       const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
         method: "PUT", headers: sbHeaders(session.token), body: JSON.stringify({ email: form.email }),
@@ -1975,8 +3663,8 @@ function AppShell() {
 
   const TABS = [
     { id: "inicio", label: "Início", icon: Home }, { id: "treino", label: "Treino", icon: Dumbbell },
-    { id: "progresso", label: "Progresso", icon: TrendingUp }, { id: "dieta", label: "Dieta", icon: Utensils },
-    { id: "perfil", label: "Perfil", icon: User },
+    { id: "dieta", label: "Dieta", icon: Utensils },
+    { id: "comunidade", label: "Comunidade", icon: Users }, { id: "perfil", label: "Perfil", icon: User },
   ];
 
   return (
@@ -2033,16 +3721,28 @@ function AppShell() {
 
             <div key={tab} className="tab-transition" style={{ flex: 1, padding: "16px 18px 100px" }}>
               {tab === "inicio" && <InicioTab profile={profile} streak={streak} trainedToday={trainedToday} plan={plan} dayIndex={dayIndex} goTreino={() => setTab("treino")} volumeSemana={volumeSemana} treinosSemana={treinosSemana} />}
-              {tab === "treino" && <TreinoTab plan={plan} dayIndex={dayIndex} setDayIndex={setDayIndex} onSwap={handleSwap} onFinish={handleFinishWorkout} profile={profile} onGenerateAI={handleGenerateWithAI} />}
-              {tab === "progresso" && <ProgressoTab exerciseLogs={exerciseLogs} bodyLogs={bodyLogs} workoutLogs={workoutLogs} weekMeals={weekMeals} metaKcal={metaKcal} onAddBodyLog={handleAddBodyLog} />}
+              {tab === "treino" && <TreinoTab plan={plan} dayIndex={dayIndex} setDayIndex={setDayIndex} onSwap={handleSwap} onFinish={handleFinishWorkout} profile={profile} onGenerateAI={handleGenerateWithAI} onShareWorkout={handleShareWorkout} onSavePhoto={handleSaveWorkoutPhoto} myCommunities={myCommunities} />}
               {tab === "dieta" && <DietaTab peso={profile.peso} objetivoPrincipal={profile.objetivo_principal} nivelAtividade={profile.nivel_atividade} dietaTipo={profile.dieta_tipo} meals={meals} waterMl={waterMl} onAddMeal={handleAddMeal} onRemoveMeal={handleRemoveMeal} onUpdateMealQty={handleUpdateMealQty} onSetMealQty={handleSetMealQty} onAddWater={handleAddWater} onRemoveWater={handleRemoveWater} aiSuggestions={aiDietSuggestions} onUseSuggestion={handleUseAISuggestion} onGenerateDietAI={handleGenerateDietWithAI} />}
-              {tab === "perfil" && <PerfilTab profile={{ ...profile, email: session.user.email }} email={session.user.email} streak={streak} trainedToday={trainedToday} freezes={freezes} onUseFreeze={handleUseFreeze} totalKg={totalKg} workoutCount={workoutLogs.length} onLogout={handleLogout} onSaveProfile={handleSaveProfile} />}
+              {tab === "comunidade" && <ComunidadeScreen userId={session.user.id} token={session.token} myProfile={{ id: session.user.id, nome: profile.nome, avatar_url: profile.avatar_url }} onShareWorkout={handleShareWorkout} onlineIds={onlineIds} hasUnreadDM={unreadCount > 0} />}
+              {tab === "perfil" && <PerfilTab profile={{ ...profile, email: session.user.email }} email={session.user.email} token={session.token} streak={streak} trainedToday={trainedToday} freezes={freezes} onUseFreeze={handleUseFreeze} totalKg={totalKg} workoutCount={workoutLogs.length} onLogout={handleLogout} onSaveProfile={handleSaveProfile}
+                exerciseLogs={exerciseLogs} bodyLogs={bodyLogs} workoutLogs={workoutLogs} weekMeals={weekMeals} metaKcal={metaKcal} onAddBodyLog={handleAddBodyLog}
+                progressPhotos={progressPhotos} bodyLogCount={bodyLogs.length} messagesSentCount={messagesSentCount} communitiesJoinedCount={myCommunities.length}
+              />}
             </div>
 
             <div style={{ position: "sticky", bottom: 0, left: 0, right: 0, background: hexToRgba(T.bg, 0.92), backdropFilter: "blur(10px)", borderTop: `1px solid ${T.line}`, display: "flex", padding: "10px 8px 14px" }}>
               {TABS.map((t) => (
                 <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, background: "none", border: "none", cursor: "pointer", color: tab === t.id ? T.flame2 : T.steelDim }}>
-                  <t.icon size={20} strokeWidth={tab === t.id ? 2.4 : 1.8} />
+                  <div style={{ position: "relative" }}>
+                    <t.icon size={20} strokeWidth={tab === t.id ? 2.4 : 1.8} />
+                    {t.id === "comunidade" && unreadCount > 0 && (
+                      <span style={{
+                        position: "absolute", top: -4, right: -7, minWidth: 14, height: 14, padding: "0 3px", borderRadius: 999,
+                        background: T.red, color: "#fff", fontFamily: "Inter", fontWeight: 800, fontSize: 8.5,
+                        display: "flex", alignItems: "center", justifyContent: "center", border: `1.5px solid ${T.bg}`,
+                      }}>{unreadCount > 9 ? "9+" : unreadCount}</span>
+                    )}
+                  </div>
                   <span style={{ fontFamily: "Inter", fontSize: 10, fontWeight: tab === t.id ? 700 : 500 }}>{t.label}</span>
                 </button>
               ))}
@@ -2051,7 +3751,7 @@ function AppShell() {
         )}
 
         <AnimatePresence>
-          {showWelcome && <WelcomeModal nome={profile?.nome || nome || "atleta"} onClose={() => setShowWelcome(false)} />}
+          {showWelcome && <WelcomeModal nome={profile?.nome || nome || "atleta"} onClose={() => { setShowWelcome(false); setTab("treino"); }} />}
         </AnimatePresence>
       </div>
     </div>

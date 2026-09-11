@@ -117,8 +117,19 @@ Perfil completo do aluno:
 TREINO: monte exatamente ${p.dias_semana} treinos (um por dia de treino da semana), com exercícios reais e apropriados para o equipamento disponível, volume de séries coerente com o nível de experiência (iniciante = mais conservador, avançado = maior volume/intensidade), evitando qualquer exercício que sobrecarregue a restrição física informada. Se o foco muscular não for "corpo inteiro", dê 1-2 exercícios a mais para os grupos priorizados. Use nomes de exercícios em português.
 
 DIETA: sugira uma refeição para cada um dos 4 horários do dia (cafe, almoco, pre_treino, jantar), coerente com o objetivo, peso e restrição alimentar informados, com valores nutricionais realistas. Respeite rigorosamente a restrição alimentar.
-
+${p.alimento_desejado ? `\nDIETA FLEXÍVEL: o aluno pediu para encaixar este alimento específico hoje: "${p.alimento_desejado}". Você DEVE OBRIGATORIAMENTE incluir este alimento em uma das refeições (o mais adequado é lanche/pré-treino ou jantar). Reduza as calorias e os carboidratos/gorduras das outras refeições do dia para que o alimento desejado caiba no saldo calórico total, mantendo o foco no objetivo do aluno.\n` : ""}
 Responda apenas com o JSON estruturado.`;
+}
+
+// decodifica só o payload do JWT (sem checar assinatura — a segurança de
+// verdade é garantida pelo RLS do Postgres quando gravamos com esse
+// Authorization header; isso aqui só serve pra sabermos QUEM está chamando)
+function getUserIdFromJWT(authHeader: string): string | null {
+  try {
+    const token = authHeader.replace("Bearer ", "");
+    const payload = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return payload.sub || null;
+  } catch (e) { return null; }
 }
 
 Deno.serve(async (req: Request) => {
@@ -129,6 +140,31 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   try {
+    const authHeader = req.headers.get("Authorization") || "";
+    const userId = getUserIdFromJWT(authHeader);
+    if (!userId) throw new Error("Não autenticado.");
+
+    // Rate limiting: no máximo 5 gerações por usuário a cada 60s,
+    // pra não estourar a cota gratuita do Gemini nem permitir abuso.
+    const SUPABASE_URL_ENV = Deno.env.get("SUPABASE_URL")!;
+    const ANON_KEY_ENV = Deno.env.get("SUPABASE_ANON_KEY")!;
+    const since = new Date(Date.now() - 60_000).toISOString();
+    const usageRes = await fetch(`${SUPABASE_URL_ENV}/rest/v1/ai_usage_log?created_at=gte.${since}&select=id`, {
+      headers: { apikey: ANON_KEY_ENV, Authorization: authHeader },
+    });
+    const usage = await usageRes.json().catch(() => []);
+    if (Array.isArray(usage) && usage.length >= 5) {
+      return new Response(JSON.stringify({ error: "Muitas gerações em pouco tempo. Aguarde um minuto e tente novamente." }), {
+        status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    // registra esta chamada (não bloqueia a resposta se falhar)
+    fetch(`${SUPABASE_URL_ENV}/rest/v1/ai_usage_log`, {
+      method: "POST",
+      headers: { apikey: ANON_KEY_ENV, Authorization: authHeader, "Content-Type": "application/json", Prefer: "return=minimal" },
+      body: JSON.stringify({ user_id: userId }),
+    }).catch(() => {});
+
     const { params } = await req.json();
     if (!params) throw new Error("Parâmetros do perfil não enviados.");
 
